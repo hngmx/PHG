@@ -25,7 +25,7 @@ DeepACO is a generic framework that leverages deep reinforcement learning to aut
 
 ### Available Problems
 
-- **Traveling Salesman Problem (TSP).** Please refer to [`tsp/`](/tsp) for vanilla DeepACO and [`tsp_nls/`](/tsp_nls) for DeepACO with NLS on TSP.
+- **Traveling Salesman Problem (TSP).** Please refer to [`tsp/`](/tsp) for vanilla DeepACO and [`tsp_nls/`](/tsp_nls) for PHG-ACO, which combines ACO+NLS with a persistent solution hypergraph and a learnable graph residual updater.
 - **Capacitated Vehicle Routing Problem (CVRP).** Please refer to [`cvrp/`](/cvrp) for vanilla DeepACO and [`cvrp_nls/`](/cvrp_nls) for DeepACO with NLS on CVRP.
 - **Orienteering Problem (OP).** Please refer to [`op/`](/op).
 - **Prize Collecting Travelling Salesman Problem (PCTSP).** Please refer to [`pctsp/`](/pctsp).

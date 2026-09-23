@@ -482,6 +482,136 @@ def compute_quality_weights(
     return (1.0 - uniform_mix) * weights + uniform_mix * uniform
 
 
+def build_learnable_solution_graph(
+    previous_heatmap,
+    distances,
+    archive: SolutionArchive,
+    max_solutions=128,
+    temperature=0.75,
+    age_decay=0.1,
+    uniform_mix=0.01,
+):
+    """Build the sparse edge-solution graph consumed by the learned updater.
+
+    TSP edges are graph nodes and archived tours are solution nodes.  Incidence
+    indices represent the two message-passing directions without materialising
+    an edge clique.  Only the highest quality/recency archive entries are kept
+    so the neural updater has a bounded memory and runtime footprint.
+    """
+    if max_solutions < 1:
+        raise ValueError("maximum solution-graph size must be positive")
+    if distances.shape != previous_heatmap.shape:
+        raise ValueError("distance matrix shape must match the heatmap")
+
+    # Rank on the archive's storage device (normally CPU), then transfer only
+    # the bounded selected subset to the neural updater's device.
+    paths, costs, rounds = archive.tensors()
+    paths = paths.to(dtype=torch.long)
+    costs = costs.to(dtype=torch.float32)
+    rounds = rounds.to(dtype=torch.long)
+    all_weights = compute_quality_weights(
+        costs,
+        rounds,
+        num_rounds=archive.num_rounds,
+        temperature=temperature,
+        age_decay=age_decay,
+        uniform_mix=uniform_mix,
+    ).to(dtype=previous_heatmap.dtype)
+
+    selected_count = min(int(max_solutions), paths.size(0))
+    selected = torch.topk(
+        all_weights,
+        k=selected_count,
+        largest=True,
+        sorted=True,
+    ).indices
+    paths = paths.index_select(0, selected).to(previous_heatmap.device)
+    costs = costs.index_select(0, selected).to(
+        device=previous_heatmap.device,
+        dtype=previous_heatmap.dtype,
+    )
+    rounds = rounds.index_select(0, selected).to(previous_heatmap.device)
+    solution_weights = all_weights.index_select(0, selected).to(
+        device=previous_heatmap.device,
+        dtype=previous_heatmap.dtype,
+    )
+    solution_weights = solution_weights / solution_weights.sum().clamp_min(EPS)
+
+    n_solutions, n_nodes = paths.shape
+    u = paths
+    v = torch.roll(paths, shifts=-1, dims=1)
+    lo = torch.minimum(u, v)
+    hi = torch.maximum(u, v)
+    flat_edge_keys = (lo * n_nodes + hi).reshape(-1)
+    unique_keys, edge_incidence = torch.unique(
+        flat_edge_keys,
+        sorted=True,
+        return_inverse=True,
+    )
+    edge_u = torch.div(unique_keys, n_nodes, rounding_mode="floor")
+    edge_v = unique_keys.remainder(n_nodes)
+    solution_incidence = torch.arange(
+        n_solutions,
+        device=paths.device,
+    ).repeat_interleave(n_nodes)
+
+    normalized_heatmap = normalize_heatmap_rows(previous_heatmap.detach())
+    heatmap_feature = 0.5 * (
+        normalized_heatmap[edge_u, edge_v]
+        + normalized_heatmap[edge_v, edge_u]
+    )
+
+    distances = distances.detach().to(
+        device=previous_heatmap.device,
+        dtype=previous_heatmap.dtype,
+    )
+    inverse_distance = distances[edge_u, edge_v].clamp_min(EPS).reciprocal()
+    inverse_distance = inverse_distance / inverse_distance.max().clamp_min(EPS)
+
+    incidence_quality = solution_weights.index_select(0, solution_incidence)
+    quality_support = previous_heatmap.new_zeros(unique_keys.numel())
+    quality_support.index_add_(0, edge_incidence, incidence_quality)
+    quality_support = quality_support / quality_support.max().clamp_min(EPS)
+
+    occurrence = previous_heatmap.new_zeros(unique_keys.numel())
+    occurrence.index_add_(
+        0,
+        edge_incidence,
+        previous_heatmap.new_ones(edge_incidence.numel()),
+    )
+    occurrence = occurrence / float(max(n_solutions, 1))
+    edge_features = torch.stack(
+        (heatmap_feature, inverse_distance, quality_support, occurrence),
+        dim=-1,
+    )
+
+    best_cost = costs.min()
+    mean_cost = costs.mean()
+    scale_floor = mean_cost.abs().clamp_min(1.0) * 1e-4
+    quality_scale = (mean_cost - best_cost).clamp_min(scale_floor)
+    normalized_gap = ((costs - best_cost) / quality_scale).clamp(min=0.0)
+    quality_score = normalized_gap.add(1.0).reciprocal()
+    latest_round = max(archive.num_rounds - 1, 0)
+    ages = latest_round - rounds.to(dtype=previous_heatmap.dtype)
+    recency = torch.exp(-float(age_decay) * ages.clamp_min(0.0))
+    solution_features = torch.stack(
+        (solution_weights, quality_score, recency),
+        dim=-1,
+    )
+
+    return {
+        "edge_features": edge_features,
+        "solution_features": solution_features,
+        "edge_incidence": edge_incidence,
+        "solution_incidence": solution_incidence,
+        "incidence_weights": incidence_quality,
+        "edge_u": edge_u,
+        "edge_v": edge_v,
+        "n_nodes": n_nodes,
+        "n_solutions": n_solutions,
+    }
+
+
 def quality_target_heatmap(
     previous_heatmap,
     archive: SolutionArchive,
@@ -634,4 +764,12 @@ def refinement_distillation_kl(previous_heatmap, refined_heatmap):
         previous_heatmap,
         refined_heatmap.detach(),
         support_mask=support_mask,
+    )
+
+
+def future_solution_quality_kl(predicted_heatmap, future_target_heatmap):
+    """Train a graph updater to anticipate the detached final archive target."""
+    return rowwise_heatmap_kl(
+        predicted_heatmap,
+        future_target_heatmap.detach(),
     )

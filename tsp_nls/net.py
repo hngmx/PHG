@@ -4,7 +4,11 @@ from torch.nn import functional as F
 from copy import deepcopy
 import torch_geometric.nn as gnn
 
-from solution_graph import graph_refined_heatmap
+from solution_graph import (
+    build_learnable_solution_graph,
+    graph_refined_heatmap,
+    normalize_heatmap_rows,
+)
 
 # GNN for edge embeddings
 class EmbNet(nn.Module):
@@ -75,17 +79,124 @@ class ParNet(MLP):
         super().__init__([self.units] * depth + [self.preds], act_fn)
     def forward(self, x):
         return super().forward(x).squeeze(dim = -1)
-    
+
+
+def _weighted_scatter_mean(values, index, weights, output_size):
+    weighted_values = values * weights.unsqueeze(-1)
+    output = values.new_zeros((output_size, values.size(-1)))
+    output.index_add_(0, index, weighted_values)
+    mass = values.new_zeros(output_size)
+    mass.index_add_(0, index, weights)
+    return output / mass.clamp_min(1e-10).unsqueeze(-1)
+
+
+class SolutionGraphLayer(nn.Module):
+    """One sparse edge-to-solution-to-edge message-passing layer."""
+
+    def __init__(self, units):
+        super().__init__()
+        self.solution_update = nn.Linear(2 * units, units)
+        self.edge_update = nn.Linear(2 * units, units)
+        self.solution_norm = nn.LayerNorm(units)
+        self.edge_norm = nn.LayerNorm(units)
+
+    def forward(
+        self,
+        edge_hidden,
+        solution_hidden,
+        edge_incidence,
+        solution_incidence,
+        incidence_weights,
+    ):
+        solution_context = _weighted_scatter_mean(
+            edge_hidden.index_select(0, edge_incidence),
+            solution_incidence,
+            incidence_weights,
+            solution_hidden.size(0),
+        )
+        solution_delta = F.silu(
+            self.solution_update(
+                torch.cat((solution_hidden, solution_context), dim=-1)
+            )
+        )
+        solution_hidden = self.solution_norm(solution_hidden + solution_delta)
+
+        edge_context = _weighted_scatter_mean(
+            solution_hidden.index_select(0, solution_incidence),
+            edge_incidence,
+            incidence_weights,
+            edge_hidden.size(0),
+        )
+        edge_delta = F.silu(
+            self.edge_update(torch.cat((edge_hidden, edge_context), dim=-1))
+        )
+        edge_hidden = self.edge_norm(edge_hidden + edge_delta)
+        return edge_hidden, solution_hidden
+
+
+class SolutionGraphNet(nn.Module):
+    """Predict a bounded heatmap residual from the cumulative solution graph."""
+
+    def __init__(self, hidden=32, layers=2, max_residual=0.25):
+        super().__init__()
+        self.max_residual = float(max_residual)
+        self.edge_input = nn.Linear(4, hidden)
+        self.solution_input = nn.Linear(3, hidden)
+        self.layers = nn.ModuleList(
+            [SolutionGraphLayer(hidden) for _ in range(layers)]
+        )
+        self.output = nn.Linear(hidden, 1)
+        # The first forward pass reproduces the deterministic base heatmap.
+        # Training then learns only the bounded correction requested by PHG-ACO.
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(self, graph):
+        edge_hidden = F.silu(self.edge_input(graph["edge_features"]))
+        solution_hidden = F.silu(
+            self.solution_input(graph["solution_features"])
+        )
+        for layer in self.layers:
+            edge_hidden, solution_hidden = layer(
+                edge_hidden,
+                solution_hidden,
+                graph["edge_incidence"],
+                graph["solution_incidence"],
+                graph["incidence_weights"],
+            )
+
+        edge_residual = self.max_residual * torch.tanh(
+            self.output(edge_hidden).squeeze(-1)
+        )
+        n_nodes = graph["n_nodes"]
+        residual = edge_residual.new_zeros((n_nodes, n_nodes))
+        residual = residual.index_put(
+            (graph["edge_u"], graph["edge_v"]),
+            edge_residual,
+            accumulate=True,
+        )
+        residual = residual.index_put(
+            (graph["edge_v"], graph["edge_u"]),
+            edge_residual,
+            accumulate=True,
+        )
+        return residual
 
 class Net(nn.Module):
-    def __init__(self, solution_graph_hidden=32, solution_graph_layers=2):
+    def __init__(
+        self,
+        solution_graph_hidden=32,
+        solution_graph_layers=2,
+        solution_graph_max_residual=0.25,
+    ):
         super().__init__()
-        # Kept in the signature so older experiment scripts still construct
-        # the model successfully.  H1 is now a fixed graph aggregation target,
-        # not a second trainable network.
-        del solution_graph_hidden, solution_graph_layers
         self.emb_net = EmbNet()
         self.par_net_heu = ParNet()
+        self.solution_graph_net = SolutionGraphNet(
+            hidden=solution_graph_hidden,
+            layers=solution_graph_layers,
+            max_residual=solution_graph_max_residual,
+        )
 
     @property
     def device(self):
@@ -109,9 +220,16 @@ class Net(nn.Module):
         prior_strength=0.05,
         propagation_strength=0.1,
         distance_prior_strength=0.1,
+        max_solutions=128,
+        return_components=False,
     ):
-        """Generate a fixed H1 pseudo-label from the cumulative solution graph."""
-        return graph_refined_heatmap(
+        """Combine deterministic aggregation with a learned bounded residual."""
+        # The search state is deliberately detached.  H0 distillation updates
+        # the initial GNN, while future-quality supervision updates this graph
+        # network through the residual only.
+        current_heatmap = current_heatmap.detach()
+        distances = distances.detach()
+        base_heatmap = graph_refined_heatmap(
             current_heatmap,
             archive,
             distances=distances,
@@ -123,6 +241,47 @@ class Net(nn.Module):
             propagation_strength=propagation_strength,
             distance_prior_strength=distance_prior_strength,
         )
+        graph = build_learnable_solution_graph(
+            current_heatmap,
+            distances,
+            archive,
+            max_solutions=max_solutions,
+            temperature=quality_temperature,
+            age_decay=age_decay,
+            uniform_mix=uniform_mix,
+        )
+        residual = self.solution_graph_net(graph)
+        refined = normalize_heatmap_rows(base_heatmap.detach() + residual)
+        if return_components:
+            return refined, base_heatmap.detach(), residual, graph
+        return refined
+
+    @staticmethod
+    def deterministic_heatmap(
+        current_heatmap,
+        distances,
+        archive,
+        quality_temperature=0.75,
+        age_decay=0.1,
+        uniform_mix=0.01,
+        elite_ratio=0.25,
+        prior_strength=0.05,
+        propagation_strength=0.1,
+        distance_prior_strength=0.1,
+    ):
+        """Build the detached final-archive target used by future KL."""
+        return graph_refined_heatmap(
+            current_heatmap.detach(),
+            archive,
+            distances=distances.detach(),
+            temperature=quality_temperature,
+            age_decay=age_decay,
+            uniform_mix=uniform_mix,
+            elite_ratio=elite_ratio,
+            prior_strength=prior_strength,
+            propagation_strength=propagation_strength,
+            distance_prior_strength=distance_prior_strength,
+        ).detach()
     
     def freeze_gnn(self):
         for param in self.emb_net.parameters():

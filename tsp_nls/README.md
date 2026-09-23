@@ -1,4 +1,4 @@
-## Per-instance iterative solution-space compression for TSP
+## PHG-ACO: persistent hypergraph-guided ACO for TSP
 
 This variant treats heatmap construction as an iterative, per-instance search
 process.  An instance owns its current heatmap, feasible-solution archive, and
@@ -29,8 +29,10 @@ particular, an NLS tour is paired with its NLS cost; a post-NLS cost is never
 assigned to the different pre-NLS path.  The archive validates that every
 stored TSP tour is a permutation of all nodes.
 
-Fixed, parameter-free hypergraph aggregation produces `H_(t+1)` from the
-cumulative feasible-tour evidence and uses it as the next sampler heatmap.
+PHG-ACO first produces a deterministic base heatmap from cumulative
+feasible-tour evidence, then applies a bounded residual predicted by a
+learnable solution-graph GNN. The combined `H_(t+1)` becomes the next sampler
+heatmap.
 Only the best-cost `elite_ratio` fraction (default `0.25`) of each newly
 sampled population updates H1. All feasible tours are still retained in the
 archive. Elite tours are explicitly quality-weighted:
@@ -54,10 +56,20 @@ support, and the preceding heatmap are row-normalized before convex mixing.
 `--distance_prior_strength` controls the geometric prior; both default to
 `0.1`.
 
-The only training loss is KL distillation:
+The learned updater selects at most 128 quality-ranked archived tours and runs
+two sparse edge-to-solution-to-edge message-passing layers. Edge nodes use the
+current heatmap probability, inverse distance, quality support, and occurrence
+frequency. Solution nodes use quality weight, normalized path quality, and
+recency. The output is a symmetric residual bounded to `[-0.25, 0.25]`; its
+final projection is zero-initialized, so a new updater starts exactly from the
+deterministic base heatmap.
+
+Training uses two KL objectives:
 
 ```text
-L = kl_weight * weighted_mean_t KL(stopgrad(P_(t+1)) || P_H0).
+L_H0 = weighted_mean_t KL(stopgrad(P_(t+1)) || P_H0)
+L_future = weighted_mean_t KL(stopgrad(P_final_archive) || P_(t+1))
+L = kl_weight * L_H0 + future_kl_weight * L_future
 ```
 
 `P_H0` and `P_(t+1)` are row-normalized heatmap probabilities with self-loops
@@ -66,9 +78,10 @@ Every increasingly refined graph heatmap supervises the initial GNN heatmap.
 The standard profile can weight later rounds as `1, 2, ..., graph_rounds`.
 The validated TSP100 fine-tuning profile instead uses equal round weights
 (`kl_round_power=0`), which was more reliable in the k=10 experiments. The
-target is detached, and H1 has no trainable parameters, so KL
-updates only the GNN+MLP that produces H0.  There is no REINFORCE loss, second
-quality KL, or entropy loss.
+first target is detached so `L_H0` updates only the GNN+MLP that produces H0.
+After all rounds, the final archive creates a detached future-quality target;
+`L_future` trains each intermediate learned graph correction to anticipate
+that structure. There is no REINFORCE or entropy loss.
 
 Training uses a rolling persistent instance pool. Instances are revisited and
 retain their detached heatmap and solution archive, but are replaced after
@@ -83,21 +96,24 @@ H_start = (1 - state_memory_strength) * H0_new
 
 The default memory strength is `0.5`, closing the loop between parameter
 updates and later pseudo-label generation without discarding instance history.
+The standard profile uses 2,000 persistent instances, batch size 20, 20 steps
+per epoch, 20 epochs, and three graph-refinement rounds.
 Pool coordinates, persistent heatmaps, and compressed archive paths are kept
 on CPU; only the current optimizer batch is materialized on the training
 device. States are never shared between different TSP instances.
 
 Testing executes the same sampling, archive, hypergraph aggregation, and
 heatmap-update loop under `torch.no_grad()`.  It does not compute KL, call
-backward, or update model parameters. Only H0's neural forward pass uses the
-GPU; parameter-free H1 refinement remains on CPU to avoid per-round transfers.
+backward, or update model parameters. ACO, NLS, the archive, and persistent
+heatmaps remain on CPU. H0 and the learned solution-graph residual run on the
+model device.
 Tour construction uses the seed-controlled PyTorch sampler by default, while
 NLS retains the bounded iterative-round budget. The optional
 `--sampling_backend numba` selects the original inference constructor; it can
 be faster at larger scales, but its thread-local random stream is not strictly
 reproducible and its thread-pool overhead made TSP50 slower in measurement.
-Action log-probabilities are skipped because the KL-only objective does not
-consume them.
+Action log-probabilities are skipped because neither KL objective consumes
+them.
 
 ### Training
 
@@ -118,7 +134,7 @@ to TSP100 because the same defaults have not been validated at other scales.
 
 TSP200:
 ```raw
-$ python3 train.py 200 --graph_rounds 3 --kl_weight 1.0 --train_pool_size 400
+$ python3 train.py 200
 ```
 
 TSP500:
@@ -132,11 +148,14 @@ $ python3 train.py 1000 --graph_rounds 3 --kl_weight 1.0
 ```
 
 `--graph_rounds` controls how many new ant populations are added on each visit
-to a training instance. `--train_pool_size` controls the rolling pool size; by
-default it is `steps * batch_size * max_instance_visits`.
+to a training instance. `--train_pool_size` controls the rolling pool size and
+defaults to 2,000 in the standard profile.
 `--profile standard` retains the general training defaults. `--state_memory_strength` controls H0 re-anchoring, `--max_instance_visits`
 controls pool replacement, `--elite_ratio` controls graph-update admission,
 and `--kl_round_power` controls the later-round KL weighting.
+`--future_kl_weight` controls final-archive supervision and
+`--max_solution_graph_solutions` bounds the learned graph to 128 tours by
+default.
 `--validation_rounds` controls validation search depth. `--quality_temperature`,
 `--age_decay`, and `--uniform_mix` control quality weighting.
 `--quality_prior_strength` smooths the quality target with the preceding
@@ -144,17 +163,18 @@ heatmap. `--seed` fixes training and uses an isolated fixed validation seed, so
 every checkpoint is evaluated with the same random stream. Epoch-0 parameters
 are saved as `tsp{N}-init.pt`; `tsp{N}-best.pt` is atomically replaced only when
 the full run completes. Old DeepACO checkpoints can be supplied with `--pretrained`.
-Checkpoint parameters from the former trainable graph updater are ignored
-because H1 is now generated by fixed aggregation.
+Missing solution-graph parameters are initialized with a zero output layer, so
+old DeepACO checkpoints start from deterministic heatmap refinement.
 
 ### Testing
 
-When `--model` is omitted, testing loads the original root checkpoint
-`../pretrained/tsp_nls/tsp{nodes}-best.pt`. Pass `--model` to select any other
-checkpoint explicitly, including
-`../pretrained/tsp_nls/optimized_v3_k10_finetune/tsp100-best.pt`. Testing
-defaults to `--seed 1234`, allowing two checkpoints to be compared with the
-same sampling randomness.
+When `--model` is omitted, testing loads the root checkpoint
+`../pretrained/tsp_nls/tsp{nodes}-best.pt`. Legacy checkpoints do not contain
+the learned solution-graph updater, so the loader initializes its output at
+zero and reproduces deterministic refinement. Use a checkpoint trained on
+this branch to evaluate the full PHG-ACO model. Pass `--model` to select it
+explicitly. Testing defaults to `--seed 1234`, allowing two checkpoints to be
+compared with the same sampling randomness.
 
 When training uses a non-default candidate size, pass the same value at test
 time, for example:
@@ -163,12 +183,9 @@ time, for example:
 $ python3 test.py 100 --k_sparse 10 --iterations 1 2 3 5 10
 ```
 
-On the 1280-instance TSP100 test set, the fine-tuned checkpoint reduced T=10
-from `7.769109` to `7.761188` at seed 1234. At seed 2234 the models were
-effectively tied (`7.760764` versus `7.760729`). These two paired runs support
-using the fine-tuned checkpoint but do not establish statistical significance;
-report multiple paired seeds when presenting final results. Wall-clock time is
-not treated as a model-quality guarantee because it varied with system load.
+Results produced by the earlier parameter-free updater are not reported as
+PHG-ACO results. Retrain the learned updater and report paired seeds before
+comparing it with DeepACO or the fixed-aggregation branch.
 
 TSP200:
 ```

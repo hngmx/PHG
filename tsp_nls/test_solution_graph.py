@@ -3,6 +3,8 @@ import unittest
 import torch
 
 from solution_graph import (
+    build_learnable_solution_graph,
+    future_solution_quality_kl,
     InstanceSearchState,
     SolutionArchive,
     compute_quality_weights,
@@ -264,6 +266,47 @@ class SolutionGraphTest(unittest.TestCase):
 
         self.assertFalse(target.requires_grad)
         self.assertTrue(torch.isfinite(target).all())
+
+    def test_learnable_graph_uses_bounded_quality_ranked_archive(self):
+        archive = SolutionArchive(n_nodes=5)
+        archive.add(
+            torch.tensor(
+                [
+                    [0, 0, 0],
+                    [1, 2, 3],
+                    [2, 4, 1],
+                    [3, 1, 4],
+                    [4, 3, 2],
+                ]
+            ),
+            torch.tensor([1.0, 3.0, 8.0]),
+        )
+        previous = torch.ones(5, 5) - torch.eye(5)
+        distances = torch.ones(5, 5) + torch.eye(5)
+        graph = build_learnable_solution_graph(
+            previous,
+            distances,
+            archive,
+            max_solutions=2,
+            uniform_mix=0.0,
+        )
+
+        self.assertEqual(graph["n_solutions"], 2)
+        self.assertEqual(graph["solution_features"].shape, (2, 3))
+        self.assertEqual(graph["edge_features"].size(1), 4)
+        self.assertEqual(graph["edge_incidence"].numel(), 10)
+        self.assertTrue(torch.isfinite(graph["edge_features"]).all())
+        self.assertTrue(torch.isfinite(graph["solution_features"]).all())
+
+    def test_future_quality_loss_updates_prediction_only(self):
+        prediction = (torch.rand(5, 5) + 0.1).requires_grad_()
+        future_target = (torch.rand(5, 5) + 0.1).requires_grad_()
+        loss = future_solution_quality_kl(prediction, future_target)
+        loss.backward()
+
+        self.assertIsNotNone(prediction.grad)
+        self.assertGreater(float(prediction.grad.abs().sum()), 0.0)
+        self.assertIsNone(future_target.grad)
 
     def test_refinement_distillation_only_updates_previous_heatmap(self):
         previous = (torch.rand(5, 5) + 0.1).requires_grad_()

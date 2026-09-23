@@ -9,6 +9,7 @@ import torch
 
 from net import Net
 from solution_graph import (
+    future_solution_quality_kl,
     InstanceSearchState,
     refinement_distillation_kl,
 )
@@ -64,7 +65,7 @@ def resolve_training_profile(
             "lr": 3e-4,
             "epochs": 20,
             "k_sparse": None,
-            "train_pool_size": None,
+            "train_pool_size": 2000,
             "kl_round_power": 1.0,
             "pretrained": None,
             "output": PRETRAINED_DIR,
@@ -119,6 +120,7 @@ def train_instance(
     k_sparse,
     graph_rounds=3,
     kl_weight=1.0,
+    future_kl_weight=1.0,
     kl_round_power=1.0,
     quality_temperature=0.75,
     age_decay=0.1,
@@ -128,9 +130,10 @@ def train_instance(
     quality_prior_strength=0.05,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
+    max_solution_graph_solutions=128,
     sampler_factory=ACOSolutionSampler,
 ):
-    """Train H0 only by KL distillation from fixed graph-refined heatmaps."""
+    """Train H0 distillation and the learnable solution-graph correction."""
     model.train()
     sum_loss = 0.0
     count = 0
@@ -152,7 +155,8 @@ def train_instance(
             local_search="nls",
         )
 
-        round_losses = []
+        h0_round_losses = []
+        graph_predictions = []
         for _ in range(graph_rounds):
             sampler.set_heatmap(state.current_heatmap.to(device))
             solutions = sampler.sample(
@@ -167,7 +171,7 @@ def train_instance(
                 solutions.feasible_paths,
                 solutions.feasible_costs,
             )
-            refined_heatmap = model.refine_heatmap(
+            refined_heatmap, _, _, _ = model.refine_heatmap(
                 state.current_heatmap.to(model.device),
                 distances,
                 state.archive,
@@ -178,17 +182,48 @@ def train_instance(
                 prior_strength=quality_prior_strength,
                 propagation_strength=propagation_strength,
                 distance_prior_strength=distance_prior_strength,
+                max_solutions=max_solution_graph_solutions,
+                return_components=True,
             )
             # Every increasingly refined heatmap supervises the trainable H0.
-            # H_(t+1) is fixed graph aggregation and is detached by the helper.
+            # The complete teacher, including the learned residual, is detached
+            # by the helper so this loss updates only the initial GNN.
             kl_loss = refinement_distillation_kl(
                 initial_heatmap, refined_heatmap
             )
-            round_losses.append(kl_weight * kl_loss)
+            h0_round_losses.append(kl_loss)
+            # Inputs to the graph updater are detached search state.  Retaining
+            # this prediction lets the final archive supervise the updater
+            # without sending gradients into H0 or the discrete search.
+            graph_predictions.append(refined_heatmap)
             # The search state outlives this optimizer step.  Keeping it on
             # CPU and detached prevents stale autograd graphs and persistent
             # GPU growth while preserving the instance's heatmap trajectory.
             state.advance(refined_heatmap.detach().cpu())
+
+        future_target = model.deterministic_heatmap(
+            state.current_heatmap.to(model.device),
+            distances,
+            state.archive,
+            quality_temperature=quality_temperature,
+            age_decay=age_decay,
+            uniform_mix=uniform_mix,
+            elite_ratio=elite_ratio,
+            prior_strength=quality_prior_strength,
+            propagation_strength=propagation_strength,
+            distance_prior_strength=distance_prior_strength,
+        )
+        future_round_losses = [
+            future_solution_quality_kl(prediction, future_target)
+            for prediction in graph_predictions
+        ]
+        round_losses = [
+            kl_weight * h0_loss + future_kl_weight * future_loss
+            for h0_loss, future_loss in zip(
+                h0_round_losses,
+                future_round_losses,
+            )
+        ]
 
         round_weights = torch.arange(
             1,
@@ -225,6 +260,7 @@ def infer_instance(
     quality_prior_strength=0.05,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
+    max_solution_graph_solutions=128,
     sampler_factory=ACOSolutionSampler,
 ):
     """Solve one instance while retaining its heatmap and graph state."""
@@ -272,8 +308,9 @@ def infer_instance(
                 prior_strength=quality_prior_strength,
                 propagation_strength=propagation_strength,
                 distance_prior_strength=distance_prior_strength,
+                max_solutions=max_solution_graph_solutions,
             )
-            state.advance(next_heatmap)
+            state.advance(next_heatmap.detach().cpu())
 
     best_aco_t = sampler.best_cost
     return np.array(
@@ -293,6 +330,7 @@ def train_epoch(
     batch_size=1,
     graph_rounds=3,
     kl_weight=1.0,
+    future_kl_weight=1.0,
     kl_round_power=1.0,
     quality_temperature=0.75,
     age_decay=0.1,
@@ -303,6 +341,7 @@ def train_epoch(
     quality_prior_strength=0.05,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
+    max_solution_graph_solutions=128,
 ):
     del n_node, epoch
     replaced = refresh_expired_instances(
@@ -322,6 +361,7 @@ def train_epoch(
             k_sparse,
             graph_rounds=graph_rounds,
             kl_weight=kl_weight,
+            future_kl_weight=future_kl_weight,
             kl_round_power=kl_round_power,
             quality_temperature=quality_temperature,
             age_decay=age_decay,
@@ -331,6 +371,7 @@ def train_epoch(
             quality_prior_strength=quality_prior_strength,
             propagation_strength=propagation_strength,
             distance_prior_strength=distance_prior_strength,
+            max_solution_graph_solutions=max_solution_graph_solutions,
         )
     return replaced
 
@@ -349,6 +390,7 @@ def validation(
     quality_prior_strength=0.05,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
+    max_solution_graph_solutions=128,
     validation_seed=12345,
 ):
     del epoch
@@ -369,6 +411,7 @@ def validation(
                     quality_prior_strength=quality_prior_strength,
                     propagation_strength=propagation_strength,
                     distance_prior_strength=distance_prior_strength,
+                    max_solution_graph_solutions=max_solution_graph_solutions,
                 )
             )
     return [value.item() for value in np.stack(stats).mean(0)]
@@ -380,13 +423,14 @@ def train(
     steps_per_epoch,
     epochs,
     k_sparse=None,
-    batch_size=3,
+    batch_size=20,
     test_size=None,
     pretrained=None,
     savepath="../pretrained/tsp_nls",
     graph_rounds=3,
     validation_rounds=T,
     kl_weight=1.0,
+    future_kl_weight=1.0,
     kl_round_power=1.0,
     quality_temperature=0.75,
     age_decay=0.1,
@@ -397,7 +441,8 @@ def train(
     quality_prior_strength=0.05,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
-    train_pool_size=None,
+    train_pool_size=2000,
+    max_solution_graph_solutions=128,
     seed=1234,
 ):
     seed_everything(seed)
@@ -448,6 +493,7 @@ def train(
         quality_prior_strength=quality_prior_strength,
         propagation_strength=propagation_strength,
         distance_prior_strength=distance_prior_strength,
+        max_solution_graph_solutions=max_solution_graph_solutions,
         validation_seed=seed + 100000,
     )
     val_results = [stats]
@@ -481,6 +527,7 @@ def train(
             batch_size=batch_size,
             graph_rounds=graph_rounds,
             kl_weight=kl_weight,
+            future_kl_weight=future_kl_weight,
             kl_round_power=kl_round_power,
             quality_temperature=quality_temperature,
             age_decay=age_decay,
@@ -491,6 +538,7 @@ def train(
             quality_prior_strength=quality_prior_strength,
             propagation_strength=propagation_strength,
             distance_prior_strength=distance_prior_strength,
+            max_solution_graph_solutions=max_solution_graph_solutions,
         )
         if replaced:
             print(f"refreshed training instances: {replaced}")
@@ -508,6 +556,7 @@ def train(
             quality_prior_strength=quality_prior_strength,
             propagation_strength=propagation_strength,
             distance_prior_strength=distance_prior_strength,
+            max_solution_graph_solutions=max_solution_graph_solutions,
             validation_seed=seed + 100000,
         )
         print(f"epoch {epoch}:", stats)
@@ -583,8 +632,7 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help=(
-            "Size of the rolling persistent pool; defaults to "
-            "steps * batch_size * max_instance_visits"
+            "Size of the rolling persistent pool; standard profile default: 2000"
         ),
     )
     parser.add_argument(
@@ -624,7 +672,13 @@ if __name__ == "__main__":
         dest="kl_weight",
         type=float,
         default=1.0,
-        help="Weight of the only loss: KL(detached graph heatmap || H0)",
+        help="Weight of KL(detached refined heatmap || H0)",
+    )
+    parser.add_argument(
+        "--future_kl_weight",
+        type=float,
+        default=1.0,
+        help="Weight of KL(final archive target || intermediate graph prediction)",
     )
     parser.add_argument(
         "--kl_round_power",
@@ -677,6 +731,12 @@ if __name__ == "__main__":
         default=0.1,
         help="Normalized inverse-distance mixture used to construct H1",
     )
+    parser.add_argument(
+        "--max_solution_graph_solutions",
+        type=int,
+        default=128,
+        help="Maximum number of quality-ranked archive tours used by the learned graph updater",
+    )
     parser.add_argument("-t", "--test_size", type=int, default=None,
                         help="Number of instances used for validation")
     parser.add_argument(
@@ -723,6 +783,8 @@ if __name__ == "__main__":
         parser.error("--state_memory_strength must be between 0 and 1")
     if opt.kl_weight < 0:
         parser.error("--kl_weight must be non-negative")
+    if opt.future_kl_weight < 0:
+        parser.error("--future_kl_weight must be non-negative")
     if opt.kl_round_power < 0:
         parser.error("--kl_round_power must be non-negative")
     if opt.quality_temperature <= 0:
@@ -739,6 +801,8 @@ if __name__ == "__main__":
         parser.error("--propagation_strength must be between 0 and 1")
     if not 0 <= opt.distance_prior_strength <= 1:
         parser.error("--distance_prior_strength must be between 0 and 1")
+    if opt.max_solution_graph_solutions < 1:
+        parser.error("--max_solution_graph_solutions must be positive")
 
     if opt.pretrained is not None and not os.path.isfile(opt.pretrained):
         parser.error(f"pretrained checkpoint not found: {opt.pretrained}")
@@ -760,6 +824,8 @@ if __name__ == "__main__":
             "validation_rounds": opt.validation_rounds,
             "train_pool_size": opt.train_pool_size,
             "kl_round_power": opt.kl_round_power,
+            "future_kl_weight": opt.future_kl_weight,
+            "max_solution_graph_solutions": opt.max_solution_graph_solutions,
             "pretrained": opt.pretrained,
             "output": opt.output,
         },
@@ -778,6 +844,7 @@ if __name__ == "__main__":
         graph_rounds=opt.graph_rounds,
         validation_rounds=opt.validation_rounds,
         kl_weight=opt.kl_weight,
+        future_kl_weight=opt.future_kl_weight,
         kl_round_power=opt.kl_round_power,
         quality_temperature=opt.quality_temperature,
         age_decay=opt.age_decay,
@@ -789,5 +856,6 @@ if __name__ == "__main__":
         propagation_strength=opt.propagation_strength,
         distance_prior_strength=opt.distance_prior_strength,
         train_pool_size=opt.train_pool_size,
+        max_solution_graph_solutions=opt.max_solution_graph_solutions,
         seed=opt.seed,
     )

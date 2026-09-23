@@ -44,14 +44,15 @@ def infer_instance(
     quality_prior_strength=0.05,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
+    max_solution_graph_solutions=128,
     sampling_backend="torch",
     sampler_factory=ACOSolutionSampler,
 ):
     """Keep one instance's graph and heatmap through all search rounds."""
     model.eval()
-    # Only the neural H0 forward pass needs the GPU.  The graph refinement is
-    # parameter-free at evaluation time, so retaining H1 and distances on the
-    # CPU avoids two device transfers in every subsequent search round.
+    # ACO and NLS remain CPU-resident.  H0 and the learned solution-graph
+    # residual run on the model device; persistent search state returns to CPU
+    # between rounds.
     initial_heatmap = (model.reshape(pyg_data, model(pyg_data)) + EPS).cpu()
     distances_cpu = distances.cpu()
     state = InstanceSearchState(initial_heatmap)
@@ -85,8 +86,8 @@ def infer_instance(
 
         if round_idx < max_round:
             next_heatmap = model.refine_heatmap(
-                state.current_heatmap,
-                distances_cpu,
+                state.current_heatmap.to(model.device),
+                distances_cpu.to(model.device),
                 state.archive,
                 quality_temperature=quality_temperature,
                 age_decay=age_decay,
@@ -95,8 +96,9 @@ def infer_instance(
                 prior_strength=quality_prior_strength,
                 propagation_strength=propagation_strength,
                 distance_prior_strength=distance_prior_strength,
+                max_solutions=max_solution_graph_solutions,
             )
-            state.advance(next_heatmap)
+            state.advance(next_heatmap.detach().cpu())
 
     return torch.tensor(
         [results[round_idx] for round_idx in evaluation_rounds],
@@ -117,6 +119,7 @@ def test(
     quality_prior_strength=0.05,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
+    max_solution_graph_solutions=128,
     sampling_backend="torch",
 ):
     sum_results = torch.zeros(size=(len(evaluation_rounds),))
@@ -135,6 +138,7 @@ def test(
             quality_prior_strength=quality_prior_strength,
             propagation_strength=propagation_strength,
             distance_prior_strength=distance_prior_strength,
+            max_solution_graph_solutions=max_solution_graph_solutions,
             sampling_backend=sampling_backend,
         )
     duration = time.time() - start
@@ -154,6 +158,7 @@ def main(
     quality_prior_strength=0.05,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
+    max_solution_graph_solutions=128,
     sampling_backend="torch",
     test_size=None,
 ):
@@ -177,7 +182,12 @@ def main(
     if incompatible.unexpected_keys:
         print(
             "ignored obsolete trainable graph-updater parameters; "
-            "H1 now uses fixed hypergraph aggregation"
+            "the current updater uses the PHG-ACO residual architecture"
+        )
+    if incompatible.missing_keys:
+        print(
+            "initialized missing PHG-ACO graph-updater parameters; "
+            "use a checkpoint trained on this branch for learned residuals"
         )
 
     avg_aco_best, duration = test(
@@ -192,6 +202,7 @@ def main(
         quality_prior_strength=quality_prior_strength,
         propagation_strength=propagation_strength,
         distance_prior_strength=distance_prior_strength,
+        max_solution_graph_solutions=max_solution_graph_solutions,
         sampling_backend=sampling_backend,
     )
     print("total duration:", duration)
@@ -286,6 +297,12 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--max_solution_graph_solutions",
+        type=int,
+        default=128,
+        help="Maximum number of quality-ranked archive tours used by the learned graph updater",
+    )
+    parser.add_argument(
         "--test_size",
         type=int,
         default=None,
@@ -315,6 +332,8 @@ if __name__ == "__main__":
         parser.error("--distance_prior_strength must be between 0 and 1")
     if opt.test_size is not None and opt.test_size < 1:
         parser.error("--test_size must be positive")
+    if opt.max_solution_graph_solutions < 1:
+        parser.error("--max_solution_graph_solutions must be positive")
 
     filepath = resolve_checkpoint_path(opt.nodes, opt.model)
     if not os.path.isfile(filepath):
@@ -341,6 +360,7 @@ if __name__ == "__main__":
         quality_prior_strength=opt.quality_prior_strength,
         propagation_strength=opt.propagation_strength,
         distance_prior_strength=opt.distance_prior_strength,
+        max_solution_graph_solutions=opt.max_solution_graph_solutions,
         sampling_backend=opt.sampling_backend,
         test_size=opt.test_size,
     )
