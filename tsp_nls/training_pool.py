@@ -66,39 +66,19 @@ def create_training_pool(count, n_nodes):
     return [PersistentTrainingInstance(item) for item in coordinates]
 
 
-def refresh_expired_instances(pool, max_visits):
-    """Replace instances after several visits while keeping the pool bounded.
-
-    Every instance can accumulate a multi-round graph before retirement, while
-    the model still sees fresh coordinate distributions over a long run.
-    Returns the number of replaced entries.
-    """
-    if max_visits < 1:
-        raise ValueError("maximum instance visits must be positive")
-    replaced = 0
-    for index, instance in enumerate(pool):
-        if instance.visits < max_visits:
-            continue
-        pool[index] = PersistentTrainingInstance(
-            torch.rand((instance.n_nodes, 2), device="cpu")
-        )
-        replaced += 1
-    return replaced
-
-
 def iter_pool_batches(pool, steps, batch_size):
-    """Yield shuffled pool members, cycling only when explicitly required."""
+    """Shuffle and yield every pool member exactly once in one epoch."""
     if not pool:
         raise ValueError("training pool cannot be empty")
     if steps < 1 or batch_size < 1:
         raise ValueError("steps and batch size must be positive")
-    if len(pool) < batch_size:
-        raise ValueError("training pool size must be at least the batch size")
-
     required = steps * batch_size
-    indices = []
-    while len(indices) < required:
-        indices.extend(torch.randperm(len(pool)).tolist())
+    if len(pool) != required:
+        raise ValueError(
+            "training pool size must equal steps * batch_size "
+            f"({len(pool)} != {steps} * {batch_size})"
+        )
 
+    indices = torch.randperm(len(pool)).tolist()
     for offset in range(0, required, batch_size):
         yield [pool[index] for index in indices[offset : offset + batch_size]]

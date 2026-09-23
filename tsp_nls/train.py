@@ -17,7 +17,6 @@ from solution_sampler import ACOSolutionSampler
 from training_pool import (
     create_training_pool,
     iter_pool_batches,
-    refresh_expired_instances,
 )
 from utils import load_val_dataset
 
@@ -53,7 +52,7 @@ def resolve_training_profile(
             "lr": 1e-4,
             "epochs": 3,
             "k_sparse": 10,
-            "train_pool_size": 800,
+            "train_pool_size": 400,
             "kl_round_power": 0.0,
             "pretrained": os.path.join(PRETRAINED_DIR, "tsp100-best.pt"),
             "output": os.path.join(
@@ -65,7 +64,7 @@ def resolve_training_profile(
             "lr": 3e-4,
             "epochs": 20,
             "k_sparse": None,
-            "train_pool_size": 2000,
+            "train_pool_size": 400,
             "kl_round_power": 1.0,
             "pretrained": None,
             "output": PRETRAINED_DIR,
@@ -337,17 +336,12 @@ def train_epoch(
     uniform_mix=0.01,
     elite_ratio=0.25,
     state_memory_strength=0.5,
-    max_instance_visits=5,
     quality_prior_strength=0.05,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
     max_solution_graph_solutions=128,
 ):
     del n_node, epoch
-    replaced = refresh_expired_instances(
-        training_pool,
-        max_visits=max_instance_visits,
-    )
     for training_batch in iter_pool_batches(
         training_pool,
         steps=steps_per_epoch,
@@ -373,7 +367,6 @@ def train_epoch(
             distance_prior_strength=distance_prior_strength,
             max_solution_graph_solutions=max_solution_graph_solutions,
         )
-    return replaced
 
 
 @torch.no_grad()
@@ -437,22 +430,23 @@ def train(
     uniform_mix=0.01,
     elite_ratio=0.25,
     state_memory_strength=0.5,
-    max_instance_visits=5,
     quality_prior_strength=0.05,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
-    train_pool_size=2000,
+    train_pool_size=400,
     max_solution_graph_solutions=128,
     seed=1234,
 ):
     seed_everything(seed)
     k_sparse = n_node // 10 if k_sparse is None else k_sparse
+    required_pool_size = steps_per_epoch * batch_size
     if train_pool_size is None:
-        train_pool_size = (
-            steps_per_epoch * batch_size * max_instance_visits
+        train_pool_size = required_pool_size
+    if train_pool_size != required_pool_size:
+        raise ValueError(
+            "training pool size must equal steps_per_epoch * batch_size "
+            f"({train_pool_size} != {steps_per_epoch} * {batch_size})"
         )
-    if train_pool_size < batch_size:
-        raise ValueError("training pool size must be at least the batch size")
 
     os.makedirs(savepath, exist_ok=True)
     net = Net().to(device)
@@ -473,8 +467,8 @@ def train(
     training_pool = create_training_pool(train_pool_size, n_node)
     print(
         "persistent training pool:",
-        f"{len(training_pool)} instances; at most {max_instance_visits} visits "
-        "before replacement",
+        f"{len(training_pool)} fixed instances; every instance is visited "
+        f"once per epoch and {epochs} times over the full run",
     )
     val_list = load_val_dataset(n_node, k_sparse, device, start_node=0)
     if test_size is not None:
@@ -515,7 +509,7 @@ def train(
     sum_time = 0
     for epoch in range(1, epochs + 1):
         start = time.time()
-        replaced = train_epoch(
+        train_epoch(
             n_node,
             n_ants,
             k_sparse,
@@ -534,14 +528,11 @@ def train(
             uniform_mix=uniform_mix,
             elite_ratio=elite_ratio,
             state_memory_strength=state_memory_strength,
-            max_instance_visits=max_instance_visits,
             quality_prior_strength=quality_prior_strength,
             propagation_strength=propagation_strength,
             distance_prior_strength=distance_prior_strength,
             max_solution_graph_solutions=max_solution_graph_solutions,
         )
-        if replaced:
-            print(f"refreshed training instances: {replaced}")
         sum_time += time.time() - start
         stats = validation(
             n_ants,
@@ -632,14 +623,8 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help=(
-            "Size of the rolling persistent pool; standard profile default: 2000"
+            "Fixed pool size; must equal steps * batch_size (default: 400)"
         ),
-    )
-    parser.add_argument(
-        "--max_instance_visits",
-        type=int,
-        default=5,
-        help="Replace a persistent instance after this many training visits",
     )
     parser.add_argument(
         "--state_memory_strength",
@@ -773,10 +758,12 @@ if __name__ == "__main__":
 
     if opt.graph_rounds < 1 or opt.validation_rounds < 1:
         parser.error("graph rounds must be positive")
-    if opt.train_pool_size is not None and opt.train_pool_size < opt.batch_size:
-        parser.error("--train_pool_size must be at least --batch_size")
-    if opt.max_instance_visits < 1:
-        parser.error("--max_instance_visits must be positive")
+    required_pool_size = opt.steps * opt.batch_size
+    if opt.train_pool_size != required_pool_size:
+        parser.error(
+            "--train_pool_size must equal --steps * --batch_size "
+            f"({required_pool_size}) so every instance is visited once per epoch"
+        )
     if opt.k_sparse is not None and not 1 <= opt.k_sparse < opt.nodes:
         parser.error("--k_sparse must be in [1, nodes - 1]")
     if not 0 <= opt.state_memory_strength <= 1:
@@ -851,7 +838,6 @@ if __name__ == "__main__":
         uniform_mix=opt.uniform_mix,
         elite_ratio=opt.elite_ratio,
         state_memory_strength=opt.state_memory_strength,
-        max_instance_visits=opt.max_instance_visits,
         quality_prior_strength=opt.quality_prior_strength,
         propagation_strength=opt.propagation_strength,
         distance_prior_strength=opt.distance_prior_strength,

@@ -5,7 +5,6 @@ import torch
 from training_pool import (
     create_training_pool,
     iter_pool_batches,
-    refresh_expired_instances,
 )
 
 
@@ -20,6 +19,20 @@ class PersistentTrainingPoolTest(unittest.TestCase):
 
         self.assertEqual(len(visited), 6)
         self.assertEqual(len(set(visited)), 6)
+
+    def test_same_pool_is_visited_once_per_epoch_for_all_epochs(self):
+        pool = create_training_pool(count=6, n_nodes=5)
+        expected = {id(instance) for instance in pool}
+
+        for _ in range(4):
+            batches = iter_pool_batches(pool, steps=2, batch_size=3)
+            visited = [instance for batch in batches for instance in batch]
+            self.assertEqual({id(instance) for instance in visited}, expected)
+            self.assertEqual(len(visited), len(expected))
+            for instance in visited:
+                instance.finish_visit()
+
+        self.assertEqual([instance.visits for instance in pool], [4] * 6)
 
     def test_instance_reuses_heatmap_and_archive_on_later_visit(self):
         instance = create_training_pool(count=1, n_nodes=5)[0]
@@ -59,26 +72,12 @@ class PersistentTrainingPoolTest(unittest.TestCase):
         self.assertFalse(second_state.current_heatmap.requires_grad)
         self.assertEqual(second_state.current_heatmap.device.type, "cpu")
 
-    def test_pool_rejects_batches_larger_than_the_pool(self):
+    def test_pool_rejects_size_different_from_epoch_demand(self):
         pool = create_training_pool(count=2, n_nodes=5)
         with self.assertRaises(ValueError):
             list(iter_pool_batches(pool, steps=1, batch_size=3))
-
-    def test_expired_instances_are_replaced_but_others_persist(self):
-        pool = create_training_pool(count=3, n_nodes=5)
-        old_ids = [id(instance) for instance in pool]
-        pool[0].visits = 5
-        pool[1].visits = 4
-        pool[2].visits = 6
-
-        replaced = refresh_expired_instances(pool, max_visits=5)
-
-        self.assertEqual(replaced, 2)
-        self.assertNotEqual(id(pool[0]), old_ids[0])
-        self.assertEqual(id(pool[1]), old_ids[1])
-        self.assertNotEqual(id(pool[2]), old_ids[2])
-        self.assertEqual(pool[0].visits, 0)
-        self.assertEqual(pool[0].n_nodes, 5)
+        with self.assertRaises(ValueError):
+            list(iter_pool_batches(pool, steps=1, batch_size=1))
 
 
 if __name__ == "__main__":

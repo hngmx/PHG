@@ -5,12 +5,12 @@ from train import resolve_training_profile
 
 
 class TrainingProfileTest(unittest.TestCase):
-    def test_standard_profile_matches_presentation_training_pool(self):
+    def test_standard_profile_uses_one_epoch_sized_training_pool(self):
         resolved = resolve_training_profile(100, "standard")
 
         self.assertEqual(resolved["lr"], 3e-4)
         self.assertEqual(resolved["epochs"], 20)
-        self.assertEqual(resolved["train_pool_size"], 2000)
+        self.assertEqual(resolved["train_pool_size"], 400)
         self.assertEqual(resolved["kl_round_power"], 1.0)
 
     def test_tsp100_finetune_profile_matches_validated_experiment(self):
@@ -19,7 +19,7 @@ class TrainingProfileTest(unittest.TestCase):
         self.assertEqual(resolved["lr"], 1e-4)
         self.assertEqual(resolved["epochs"], 3)
         self.assertEqual(resolved["k_sparse"], 10)
-        self.assertEqual(resolved["train_pool_size"], 800)
+        self.assertEqual(resolved["train_pool_size"], 400)
         self.assertEqual(resolved["kl_round_power"], 0.0)
         self.assertTrue(resolved["pretrained"].endswith("tsp100-best.pt"))
         self.assertTrue(

@@ -83,10 +83,10 @@ After all rounds, the final archive creates a detached future-quality target;
 `L_future` trains each intermediate learned graph correction to anticipate
 that structure. There is no REINFORCE or entropy loss.
 
-Training uses a rolling persistent instance pool. Instances are revisited and
-retain their detached heatmap and solution archive, but are replaced after
-`max_instance_visits` visits (default `5`) to prevent a small fixed pool from
-dominating generalization. Before every repeat visit, the latest model H0 is
+Training uses a fixed persistent instance pool. Every epoch shuffles the pool
+and visits every instance exactly once, with no omission, duplication, or
+replacement. Therefore, an instance participates exactly as many times as the
+number of training epochs. Before every repeat visit, the latest model H0 is
 row-normalized and fused with the stored heatmap:
 
 ```text
@@ -96,8 +96,9 @@ H_start = (1 - state_memory_strength) * H0_new
 
 The default memory strength is `0.5`, closing the loop between parameter
 updates and later pseudo-label generation without discarding instance history.
-The standard profile uses 2,000 persistent instances, batch size 20, 20 steps
-per epoch, 20 epochs, and three graph-refinement rounds.
+The standard profile uses 400 persistent instances, batch size 20, 20 steps
+per epoch, 20 epochs, and three graph-refinement rounds. Each of the 400
+instances therefore participates exactly 20 times.
 Pool coordinates, persistent heatmaps, and compressed archive paths are kept
 on CPU; only the current optimizer batch is materialized on the training
 device. States are never shared between different TSP instances.
@@ -126,7 +127,7 @@ $ python3 train.py 100 --profile tsp100_finetune
 
 This explicit profile starts from `../pretrained/tsp_nls/tsp100-best.pt` and
 uses the measured configuration: `k_sparse=10`, `lr=1e-4`, 3 epochs, 48 ants,
-3 graph rounds, 5 validation rounds, a rolling pool of 800 instances, and
+3 graph rounds, 5 validation rounds, a fixed pool of 400 instances, and
 equal KL weights across graph rounds. It writes checkpoints to
 `../pretrained/tsp_nls/optimized_v3_k10_finetune`. Individual command-line
 flags still override profile values. The profile is deliberately restricted
@@ -148,11 +149,13 @@ $ python3 train.py 1000 --graph_rounds 3 --kl_weight 1.0
 ```
 
 `--graph_rounds` controls how many new ant populations are added on each visit
-to a training instance. `--train_pool_size` controls the rolling pool size and
-defaults to 2,000 in the standard profile.
-`--profile standard` retains the general training defaults. `--state_memory_strength` controls H0 re-anchoring, `--max_instance_visits`
-controls pool replacement, `--elite_ratio` controls graph-update admission,
-and `--kl_round_power` controls the later-round KL weighting.
+to a training instance. `--train_pool_size` controls the fixed pool size,
+defaults to 400, and must equal `--steps * --batch_size` so every pool member
+is visited exactly once per epoch.
+`--profile standard` retains the general training defaults.
+`--state_memory_strength` controls H0 re-anchoring,
+`--elite_ratio` controls graph-update admission, and `--kl_round_power`
+controls the later-round KL weighting.
 `--future_kl_weight` controls final-archive supervision and
 `--max_solution_graph_solutions` bounds the learned graph to 128 tours by
 default.
