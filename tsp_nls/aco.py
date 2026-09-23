@@ -59,6 +59,15 @@ class ACO():
 
         self.device = device
 
+    def set_heuristic(self, heuristic):
+        """Replace the heuristic matrix between dynamic solution-graph rounds."""
+        if heuristic.shape != self.distances.shape:
+            raise ValueError(
+                f"heuristic must have shape {tuple(self.distances.shape)}, "
+                f"got {tuple(heuristic.shape)}"
+            )
+        self.heuristic = heuristic.to(self.device)
+
     @torch.no_grad()
     def sparsify(self, k_sparse):
         '''
@@ -77,7 +86,7 @@ class ACO():
         sparse_distances[edge_index_u, edge_index_v] = self.distances[edge_index_u, edge_index_v]
         self.heuristic = 1 / sparse_distances
     
-    def sample(self, inference = False):
+    def sample(self, inference=False, require_prob=True):
         if inference:
             probmat = (self.pheromone ** self.alpha) * (self.heuristic ** self.beta)
             paths = inference_batch_sample(probmat.cpu().numpy(), self.n_ants, 0)
@@ -85,7 +94,11 @@ class ACO():
             costs = self.gen_path_costs(paths)
             return costs, None, paths
         else:
-            paths, log_probs = self.gen_path(require_prob=True)
+            generated = self.gen_path(require_prob=require_prob)
+            if require_prob:
+                paths, log_probs = generated
+            else:
+                paths, log_probs = generated, None
             costs = self.gen_path_costs(paths)
             return costs, log_probs, paths
     
@@ -101,32 +114,54 @@ class ACO():
             paths = self.nls(paths, inference)
         return paths
 
+    def sample_iteration(
+        self,
+        inference=False,
+        require_prob=False,
+        local_search_inference=None,
+    ):
+        """Sample, run NLS, update the incumbent and deposit pheromone once.
+
+        Raw and locally improved tours are returned separately, each with its
+        own matching costs.  The iterative solution-graph learner archives the
+        feasible improved tours and uses raw tours for policy-gradient credit.
+        """
+        raw_costs, log_probs, raw_paths = self.sample(
+            inference=inference,
+            require_prob=require_prob,
+        )
+        # Path construction and local-search budgets are independent choices.
+        # At test time this lets us keep DeepACO's fast Numba constructor while
+        # retaining the bounded NLS budget used by the iterative graph rounds.
+        if local_search_inference is None:
+            local_search_inference = inference
+        improved_paths = self.local_search(
+            raw_paths,
+            inference=local_search_inference,
+        )
+        improved_costs = self.gen_path_costs(improved_paths)
+        self.update_best(improved_paths, improved_costs)
+        self.update_pheronome(improved_paths, improved_costs)
+        return raw_costs, improved_costs, log_probs, raw_paths, improved_paths
+
     @torch.no_grad()
     def run(self, n_iterations, inference = False):
         for _ in range(n_iterations):
-            if inference:
-                probmat = (self.pheromone ** self.alpha) * (self.heuristic ** self.beta)
-                paths = inference_batch_sample(probmat.cpu().numpy(), self.n_ants, 0)
-                paths = torch.from_numpy(paths.T.astype(np.int64)).to(self.device)
-            else:
-                paths = self.gen_path(require_prob=False)
-
-            paths = self.local_search(paths, inference)
-            costs = self.gen_path_costs(paths)
-            
-            best_cost, best_idx = costs.min(dim=0)
-            if best_cost < self.lowest_cost:
-                self.shortest_path = paths[:, best_idx]
-                self.lowest_cost = best_cost.item()
-                if self.min_max:
-                    max = self.problem_size / self.lowest_cost
-                    if self.max is None:
-                        self.pheromone *= max/self.pheromone.max()
-                    self.max = max
-            
-            self.update_pheronome(paths, costs)
+            self.sample_iteration(inference=inference)
 
         return self.lowest_cost
+
+    @torch.no_grad()
+    def update_best(self, paths, costs):
+        best_cost, best_idx = costs.min(dim=0)
+        if best_cost < self.lowest_cost:
+            self.shortest_path = paths[:, best_idx]
+            self.lowest_cost = best_cost.item()
+            if self.min_max:
+                max_pheromone = self.problem_size / self.lowest_cost
+                if self.max is None:
+                    self.pheromone *= max_pheromone / self.pheromone.max()
+                self.max = max_pheromone
        
     @torch.no_grad()
     def update_pheronome(self, paths, costs):
@@ -223,11 +258,11 @@ class ACO():
     def distances_numpy(self):
         return self.distances.detach().cpu().numpy().astype(np.float32)
 
-    @cached_property
+    @property
     def heuristic_numpy(self):
         return self.heuristic.detach().cpu().numpy().astype(np.float32)
     
-    @cached_property
+    @property
     def heuristic_dist(self):
         return 1 / (self.heuristic_numpy/self.heuristic_numpy.max(-1, keepdims=True) + 1e-5)
     

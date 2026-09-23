@@ -4,6 +4,8 @@ from torch.nn import functional as F
 from copy import deepcopy
 import torch_geometric.nn as gnn
 
+from solution_graph import graph_refined_heatmap
+
 # GNN for edge embeddings
 class EmbNet(nn.Module):
     def __init__(self, depth=12, feats=1, units=32, act_fn='silu', agg_fn='mean'):
@@ -76,16 +78,51 @@ class ParNet(MLP):
     
 
 class Net(nn.Module):
-    def __init__(self):
+    def __init__(self, solution_graph_hidden=32, solution_graph_layers=2):
         super().__init__()
+        # Kept in the signature so older experiment scripts still construct
+        # the model successfully.  H1 is now a fixed graph aggregation target,
+        # not a second trainable network.
+        del solution_graph_hidden, solution_graph_layers
         self.emb_net = EmbNet()
         self.par_net_heu = ParNet()
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
 
     def forward(self, pyg):
         x, edge_index, edge_attr = pyg.x, pyg.edge_index, pyg.edge_attr
         emb = self.emb_net(x, edge_index, edge_attr)
         heu = self.par_net_heu(emb)
         return heu
+
+    def refine_heatmap(
+        self,
+        current_heatmap,
+        distances,
+        archive,
+        quality_temperature=0.75,
+        age_decay=0.1,
+        uniform_mix=0.01,
+        elite_ratio=0.25,
+        prior_strength=0.05,
+        propagation_strength=0.1,
+        distance_prior_strength=0.1,
+    ):
+        """Generate a fixed H1 pseudo-label from the cumulative solution graph."""
+        return graph_refined_heatmap(
+            current_heatmap,
+            archive,
+            distances=distances,
+            temperature=quality_temperature,
+            age_decay=age_decay,
+            uniform_mix=uniform_mix,
+            elite_ratio=elite_ratio,
+            prior_strength=prior_strength,
+            propagation_strength=propagation_strength,
+            distance_prior_strength=distance_prior_strength,
+        )
     
     def freeze_gnn(self):
         for param in self.emb_net.parameters():
@@ -100,4 +137,3 @@ class Net(nn.Module):
         matrix = torch.zeros(size=(n_nodes, n_nodes), device=device)
         matrix[pyg.edge_index[0], pyg.edge_index[1]] = vector
         return matrix
-        
