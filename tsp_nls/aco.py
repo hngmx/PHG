@@ -22,7 +22,7 @@ class ACO():
                  min=None,
                  two_opt = False, # for compatibility
                  device='cpu',
-                 local_search = 'nls',
+                 local_search = None,
                  ):
         
         self.problem_size = len(distances)
@@ -120,26 +120,28 @@ class ACO():
         require_prob=False,
         local_search_inference=None,
     ):
-        """Sample, run NLS, update the incumbent and deposit pheromone once.
+        """Sample tours, optionally improve them, and update ACO state once.
 
         Raw and locally improved tours are returned separately, each with its
-        own matching costs.  The iterative solution-graph learner archives the
-        feasible improved tours and uses raw tours for policy-gradient credit.
+        own matching costs. With local search disabled, both pairs refer to
+        the same sampled tours and no improvement routine is called.
         """
         raw_costs, log_probs, raw_paths = self.sample(
             inference=inference,
             require_prob=require_prob,
         )
-        # Path construction and local-search budgets are independent choices.
-        # At test time this lets us keep DeepACO's fast Numba constructor while
-        # retaining the bounded NLS budget used by the iterative graph rounds.
-        if local_search_inference is None:
-            local_search_inference = inference
-        improved_paths = self.local_search(
-            raw_paths,
-            inference=local_search_inference,
-        )
-        improved_costs = self.gen_path_costs(improved_paths)
+        if self.local_search_type is None:
+            improved_paths = raw_paths
+            improved_costs = raw_costs
+        else:
+            # Path construction and local-search budgets are independent.
+            if local_search_inference is None:
+                local_search_inference = inference
+            improved_paths = self.local_search(
+                raw_paths,
+                inference=local_search_inference,
+            )
+            improved_costs = self.gen_path_costs(improved_paths)
         self.update_best(improved_paths, improved_costs)
         self.update_pheronome(improved_paths, improved_costs)
         return raw_costs, improved_costs, log_probs, raw_paths, improved_paths

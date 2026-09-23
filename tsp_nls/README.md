@@ -10,11 +10,12 @@ problem graph -> H0 -> constrained sampling -> solution hypergraph -> H1
 ```
 
 The initial GNN heatmap is sparse and therefore compresses the candidate
-solution space.  A sampler is accessed through the interface in
-`solution_sampler.py`; ACO+NLS is the default, but a different constrained
-decoder can return the same `SolutionBatch` fields.
+solution space. A sampler is accessed through the interface in
+`solution_sampler.py`; ACO sampling is used directly and local search is
+disabled. A different constrained decoder can return the same
+`SolutionBatch` fields.
 
-Every distinct feasible NLS tour from every round is retained in the
+Every distinct feasible ACO tour from every round is retained in the
 instance's cumulative solution hypergraph. Cyclic rotations and reversed
 orientations of the same undirected tour are stored once; observing a duplicate
 refreshes its recency instead of multiplying its weight:
@@ -24,10 +25,8 @@ refreshes its recency instead of multiplying its weight:
 - two edge nodes are therefore related by the set of archived tours containing
   both of them, without materialising the equivalent quadratic clique graph.
 
-The path stored in the graph is always paired with its own cost.  In
-particular, an NLS tour is paired with its NLS cost; a post-NLS cost is never
-assigned to the different pre-NLS path.  The archive validates that every
-stored TSP tour is a permutation of all nodes.
+The path stored in the graph is always paired with its own cost. The archive
+validates that every stored TSP tour is a permutation of all nodes.
 
 PHG-ACO first produces a deterministic base heatmap from cumulative
 feasible-tour evidence, then applies a bounded residual predicted by a
@@ -41,8 +40,8 @@ archive. Elite tours are explicitly quality-weighted:
 w_i = softmax(-(q_i - q_best) / (temperature * quality_scale))
 ```
 
-A scale floor prevents nearly identical NLS costs from producing a numerical
-one-hot target. A small uniform mixture (default `0.01`) preserves limited
+A scale floor prevents nearly identical ACO tour costs from producing a
+numerical one-hot target. A small uniform mixture (default `0.01`) preserves limited
 diversity among the elite set. Compact unique
 paths remain available for inspection, while the hot path processes only the
 new population and incrementally updates sufficient edge and propagation
@@ -105,12 +104,11 @@ device. States are never shared between different TSP instances.
 
 Testing executes the same sampling, archive, hypergraph aggregation, and
 heatmap-update loop under `torch.no_grad()`.  It does not compute KL, call
-backward, or update model parameters. ACO, NLS, the archive, and persistent
+backward, or update model parameters. ACO, the archive, and persistent
 heatmaps remain on CPU. H0 and the learned solution-graph residual run on the
-model device.
-Tour construction uses the seed-controlled PyTorch sampler by default, while
-NLS retains the bounded iterative-round budget. The optional
-`--sampling_backend numba` selects the original inference constructor; it can
+model device. No NLS or 2-opt improvement is applied.
+Tour construction uses the seed-controlled PyTorch sampler by default. The
+optional `--sampling_backend numba` selects the original inference constructor; it can
 be faster at larger scales, but its thread-local random stream is not strictly
 reproducible and its thread-pool overhead made TSP50 slower in measurement.
 Action log-probabilities are skipped because neither KL objective consumes

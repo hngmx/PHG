@@ -151,7 +151,7 @@ def train_instance(
             heatmap=state.current_heatmap.to(device),
             distances=distances,
             device=device,
-            local_search="nls",
+            local_search=None,
         )
 
         h0_round_losses = []
@@ -163,9 +163,8 @@ def train_instance(
                 require_log_probs=False,
             )
 
-            # Only admit a path together with its own objective value.  The
-            # old implementation attached NLS costs to pre-NLS paths, making
-            # edge-level quality credit inconsistent.
+            # Only admit a sampled path together with its own objective value
+            # so edge-level quality credit remains consistent.
             state.add_feasible_solutions(
                 solutions.feasible_paths,
                 solutions.feasible_costs,
@@ -273,7 +272,7 @@ def infer_instance(
         heatmap=state.current_heatmap.cpu(),
         distances=distances.cpu(),
         device="cpu",
-        local_search="nls",
+        local_search=None,
     )
 
     baseline = None

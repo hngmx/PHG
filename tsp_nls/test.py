@@ -50,9 +50,9 @@ def infer_instance(
 ):
     """Keep one instance's graph and heatmap through all search rounds."""
     model.eval()
-    # ACO and NLS remain CPU-resident.  H0 and the learned solution-graph
-    # residual run on the model device; persistent search state returns to CPU
-    # between rounds.
+    # ACO remains CPU-resident. H0 and the learned solution-graph residual run
+    # on the model device; persistent search state returns to CPU between
+    # rounds. Local search is deliberately disabled.
     initial_heatmap = (model.reshape(pyg_data, model(pyg_data)) + EPS).cpu()
     distances_cpu = distances.cpu()
     state = InstanceSearchState(initial_heatmap)
@@ -61,7 +61,7 @@ def infer_instance(
         heatmap=state.current_heatmap,
         distances=distances_cpu,
         device="cpu",
-        local_search="nls",
+        local_search=None,
     )
 
     requested = set(evaluation_rounds)
@@ -72,9 +72,6 @@ def infer_instance(
         solutions = sampler.sample(
             inference=sampling_backend == "numba",
             require_log_probs=False,
-            # Keep NLS bounded even when the Numba inference constructor is
-            # selected; otherwise inference=True would raise maxt to 10000.
-            local_search_inference=False,
         )
         state.add_feasible_solutions(
             solutions.feasible_paths,

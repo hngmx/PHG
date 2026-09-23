@@ -468,7 +468,7 @@ def compute_quality_weights(
     costs = costs.to(dtype=torch.float32) if not costs.is_floating_point() else costs
     rounds = rounds.to(device=costs.device, dtype=costs.dtype)
     # Preserve objective-value differences while preventing nearly identical
-    # NLS costs from producing a numerically one-hot target.
+    # sampled-tour costs from producing a numerically one-hot target.
     best_cost = costs.min()
     mean_cost = costs.mean()
     scale_floor = mean_cost.abs().clamp_min(1.0) * 1e-4

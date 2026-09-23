@@ -19,8 +19,8 @@ class SolutionBatch:
 
     ``sampled_paths`` and ``sampled_costs`` always correspond to one another.
     ``feasible_paths`` and ``feasible_costs`` are the paths admitted to the
-    cumulative solution graph.  For the ACO+NLS implementation they are the
-    locally improved, valid TSP tours and their actual costs.
+    cumulative solution graph. With local search disabled they are the valid
+    tours sampled directly by ACO and their matching costs.
     """
 
     sampled_costs: torch.Tensor
@@ -39,7 +39,7 @@ class ACOSolutionSampler:
         heatmap,
         distances,
         device,
-        local_search="nls",
+        local_search=None,
     ):
         self._aco = ACO(
             n_ants=n_solutions,
