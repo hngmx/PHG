@@ -34,7 +34,7 @@ class PersistentTrainingPoolTest(unittest.TestCase):
 
         self.assertEqual([instance.visits for instance in pool], [4] * 6)
 
-    def test_instance_reuses_heatmap_and_archive_on_later_visit(self):
+    def test_instance_discards_old_heatmap_but_reuses_archive(self):
         instance = create_training_pool(count=1, n_nodes=5)[0]
         first_state = instance.get_or_create_state(torch.ones(5, 5))
         first_state.add_feasible_solutions(
@@ -46,18 +46,14 @@ class PersistentTrainingPoolTest(unittest.TestCase):
 
         latest_h0 = torch.ones(5, 5) - torch.eye(5)
         latest_h0[0, 1] = 4.0
-        second_state = instance.get_or_create_state(
-            latest_h0,
-            memory_strength=0.5,
-        )
+        second_state = instance.get_or_create_state(latest_h0)
 
         self.assertIs(second_state, first_state)
         self.assertEqual(instance.visits, 1)
         self.assertEqual(len(second_state.archive), 1)
         self.assertEqual(second_state.archive.num_rounds, 1)
-        self.assertFalse(
-            torch.equal(second_state.current_heatmap, torch.full((5, 5), 2.0))
-        )
+        expected = latest_h0 / latest_h0.sum(dim=-1, keepdim=True)
+        self.assertTrue(torch.allclose(second_state.current_heatmap, expected))
         self.assertGreater(
             float(second_state.current_heatmap[0, 1]),
             float(second_state.current_heatmap[0, 2]),

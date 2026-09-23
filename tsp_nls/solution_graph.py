@@ -388,7 +388,7 @@ class InstanceSearchState:
     def add_feasible_solutions(self, paths, costs):
         self.archive.add(paths, costs)
 
-    def reanchor(self, model_heatmap, memory_strength=0.5):
+    def reanchor(self, model_heatmap, memory_strength=0.0):
         """Fuse the latest model H0 into this instance's persistent heatmap.
 
         The archive remains untouched.  Re-anchoring closes the training loop:

@@ -93,8 +93,10 @@ H_start = (1 - state_memory_strength) * H0_new
           + state_memory_strength * H_memory
 ```
 
-The default memory strength is `0.5`, closing the loop between parameter
-updates and later pseudo-label generation without discarding instance history.
+The default memory strength is `0`, so the historical heatmap is discarded
+and `H_start = normalize(H0_new)`. The cumulative solution archive remains
+available to the graph updater, and inner-round heatmaps still evolve through
+the normal `H0 -> H1 -> H2` refinement sequence.
 The standard profile uses 400 persistent instances, batch size 20, 20 steps
 per epoch, 20 epochs, and three graph-refinement rounds. Each of the 400
 instances therefore participates exactly 20 times.
@@ -151,7 +153,7 @@ to a training instance. `--train_pool_size` controls the fixed pool size,
 defaults to 400, and must equal `--steps * --batch_size` so every pool member
 is visited exactly once per epoch.
 `--profile standard` retains the general training defaults.
-`--state_memory_strength` controls H0 re-anchoring,
+`--state_memory_strength` controls H0 re-anchoring and defaults to `0`,
 `--elite_ratio` controls graph-update admission, and `--kl_round_power`
 controls the later-round KL weighting.
 `--future_kl_weight` controls final-archive supervision and

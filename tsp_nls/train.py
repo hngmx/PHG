@@ -125,7 +125,7 @@ def train_instance(
     age_decay=0.1,
     uniform_mix=0.01,
     elite_ratio=0.25,
-    state_memory_strength=0.5,
+    state_memory_strength=0.0,
     quality_prior_strength=0.05,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
@@ -334,7 +334,7 @@ def train_epoch(
     age_decay=0.1,
     uniform_mix=0.01,
     elite_ratio=0.25,
-    state_memory_strength=0.5,
+    state_memory_strength=0.0,
     quality_prior_strength=0.05,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
@@ -428,7 +428,7 @@ def train(
     age_decay=0.1,
     uniform_mix=0.01,
     elite_ratio=0.25,
-    state_memory_strength=0.5,
+    state_memory_strength=0.0,
     quality_prior_strength=0.05,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
@@ -628,8 +628,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--state_memory_strength",
         type=float,
-        default=0.5,
-        help="Weight of the persistent heatmap when re-anchoring with latest H0",
+        default=0.0,
+        help=(
+            "Weight of the previous heatmap when starting a new epoch; "
+            "default 0 uses only the latest H0"
+        ),
     )
     parser.add_argument(
         "--seed",
@@ -809,6 +812,7 @@ if __name__ == "__main__":
             "graph_rounds": opt.graph_rounds,
             "validation_rounds": opt.validation_rounds,
             "train_pool_size": opt.train_pool_size,
+            "state_memory_strength": opt.state_memory_strength,
             "kl_round_power": opt.kl_round_power,
             "future_kl_weight": opt.future_kl_weight,
             "max_solution_graph_solutions": opt.max_solution_graph_solutions,

@@ -37,7 +37,7 @@ class PersistentTrainingInstance:
             start_node=0,
         )
 
-    def get_or_create_state(self, initial_heatmap, memory_strength=0.5):
+    def get_or_create_state(self, initial_heatmap, memory_strength=0.0):
         """Return persistent state re-anchored by the latest model H0."""
         if self.state is None:
             self.state = InstanceSearchState(
