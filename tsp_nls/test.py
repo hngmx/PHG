@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from net import Net
+from net import Net, REFINEMENT_MODES
 from solution_graph import InstanceSearchState
 from solution_sampler import ACOSolutionSampler
 from utils import load_test_dataset
@@ -45,23 +45,31 @@ def infer_instance(
     propagation_strength=0.1,
     distance_prior_strength=0.1,
     max_solution_graph_solutions=128,
+    max_archive_solutions=256,
+    max_archive_rounds=10,
+    refinement_mode="full",
+    local_search=None,
     sampling_backend="torch",
     sampler_factory=ACOSolutionSampler,
 ):
     """Keep one instance's graph and heatmap through all search rounds."""
     model.eval()
     # ACO remains CPU-resident. H0 and the learned solution-graph residual run
-    # on the model device; persistent search state returns to CPU between
-    # rounds. Local search is deliberately disabled.
+    # on the model device; visit-local search state returns to CPU between
+    # rounds. Local search follows the explicit matched-baseline option.
     initial_heatmap = (model.reshape(pyg_data, model(pyg_data)) + EPS).cpu()
     distances_cpu = distances.cpu()
-    state = InstanceSearchState(initial_heatmap)
+    state = InstanceSearchState(
+        initial_heatmap,
+        archive_max_solutions=max_archive_solutions,
+        archive_max_rounds=max_archive_rounds,
+    )
     sampler = sampler_factory(
         n_solutions=n_ants,
         heatmap=state.current_heatmap,
         distances=distances_cpu,
         device="cpu",
-        local_search=None,
+        local_search=local_search,
     )
 
     requested = set(evaluation_rounds)
@@ -72,6 +80,7 @@ def infer_instance(
         solutions = sampler.sample(
             inference=sampling_backend == "numba",
             require_log_probs=False,
+            local_search_inference=False if local_search is not None else None,
         )
         state.add_feasible_solutions(
             solutions.feasible_paths,
@@ -94,6 +103,7 @@ def infer_instance(
                 propagation_strength=propagation_strength,
                 distance_prior_strength=distance_prior_strength,
                 max_solutions=max_solution_graph_solutions,
+                refinement_mode=refinement_mode,
             )
             state.advance(next_heatmap.detach().cpu())
 
@@ -117,6 +127,10 @@ def test(
     propagation_strength=0.1,
     distance_prior_strength=0.1,
     max_solution_graph_solutions=128,
+    max_archive_solutions=256,
+    max_archive_rounds=10,
+    refinement_mode="full",
+    local_search=None,
     sampling_backend="torch",
 ):
     sum_results = torch.zeros(size=(len(evaluation_rounds),))
@@ -136,6 +150,10 @@ def test(
             propagation_strength=propagation_strength,
             distance_prior_strength=distance_prior_strength,
             max_solution_graph_solutions=max_solution_graph_solutions,
+            max_archive_solutions=max_archive_solutions,
+            max_archive_rounds=max_archive_rounds,
+            refinement_mode=refinement_mode,
+            local_search=local_search,
             sampling_backend=sampling_backend,
         )
     duration = time.time() - start
@@ -156,6 +174,10 @@ def main(
     propagation_strength=0.1,
     distance_prior_strength=0.1,
     max_solution_graph_solutions=128,
+    max_archive_solutions=256,
+    max_archive_rounds=10,
+    refinement_mode="full",
+    local_search=None,
     sampling_backend="torch",
     test_size=None,
 ):
@@ -200,6 +222,10 @@ def main(
         propagation_strength=propagation_strength,
         distance_prior_strength=distance_prior_strength,
         max_solution_graph_solutions=max_solution_graph_solutions,
+        max_archive_solutions=max_archive_solutions,
+        max_archive_rounds=max_archive_rounds,
+        refinement_mode=refinement_mode,
+        local_search=local_search,
         sampling_backend=sampling_backend,
     )
     print("total duration:", duration)
@@ -300,6 +326,30 @@ if __name__ == "__main__":
         help="Maximum number of quality-ranked archive tours used by the learned graph updater",
     )
     parser.add_argument(
+        "--max_archive_solutions",
+        type=int,
+        default=256,
+        help="Hard limit on full unique tours retained by one test instance",
+    )
+    parser.add_argument(
+        "--max_archive_rounds",
+        type=int,
+        default=10,
+        help="Hard limit on raw ACO populations retained by one test instance",
+    )
+    parser.add_argument(
+        "--refinement_mode",
+        choices=REFINEMENT_MODES,
+        default="full",
+        help="Ablate H0-only, deterministic, learned-only, or full refinement",
+    )
+    parser.add_argument(
+        "--local_search",
+        choices=("none", "2opt", "nls"),
+        default="none",
+        help="Optional local-search baseline; default is pure ACO",
+    )
+    parser.add_argument(
         "--test_size",
         type=int,
         default=None,
@@ -331,6 +381,16 @@ if __name__ == "__main__":
         parser.error("--test_size must be positive")
     if opt.max_solution_graph_solutions < 1:
         parser.error("--max_solution_graph_solutions must be positive")
+    if opt.max_archive_solutions < 1:
+        parser.error("--max_archive_solutions must be positive")
+    if opt.max_archive_rounds < 1:
+        parser.error("--max_archive_rounds must be positive")
+    if opt.max_solution_graph_solutions > opt.max_archive_solutions:
+        parser.error(
+            "--max_solution_graph_solutions cannot exceed "
+            "--max_archive_solutions"
+        )
+    opt.local_search = None if opt.local_search == "none" else opt.local_search
 
     filepath = resolve_checkpoint_path(opt.nodes, opt.model)
     if not os.path.isfile(filepath):
@@ -358,6 +418,10 @@ if __name__ == "__main__":
         propagation_strength=opt.propagation_strength,
         distance_prior_strength=opt.distance_prior_strength,
         max_solution_graph_solutions=opt.max_solution_graph_solutions,
+        max_archive_solutions=opt.max_archive_solutions,
+        max_archive_rounds=opt.max_archive_rounds,
+        refinement_mode=opt.refinement_mode,
+        local_search=opt.local_search,
         sampling_backend=opt.sampling_backend,
         test_size=opt.test_size,
     )

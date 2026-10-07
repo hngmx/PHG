@@ -9,8 +9,8 @@ equivalent hypergraph incidence representation instead:
     edge node <-> sampled solution (hyperedge)
 
 Two edge nodes are related exactly when they share at least one solution
-hyperedge.  All distinct sampled solutions from all rounds remain in
-``SolutionArchive``; rotation/reversal duplicates refresh recency in place.
+hyperedge.  The bounded ``SolutionArchive`` retains quality-ranked recent
+solutions; rotation/reversal duplicates refresh recency in place.
 """
 
 from __future__ import annotations
@@ -31,6 +31,8 @@ class SolutionArchive:
         storage_device=None,
         path_dtype=None,
         deduplicate=True,
+        max_solutions=256,
+        max_rounds=10,
     ):
         self.n_nodes = n_nodes
         self.storage_device = (
@@ -38,6 +40,12 @@ class SolutionArchive:
         )
         self.path_dtype = path_dtype
         self.deduplicate = deduplicate
+        if max_solutions is not None and max_solutions < 1:
+            raise ValueError("archive solution limit must be positive")
+        if max_rounds is not None and max_rounds < 1:
+            raise ValueError("archive round limit must be positive")
+        self.max_solutions = max_solutions
+        self.max_rounds = max_rounds
         if path_dtype is not None:
             if path_dtype not in (torch.int16, torch.int32, torch.int64):
                 raise ValueError("archive path dtype must be an integer dtype")
@@ -56,6 +64,74 @@ class SolutionArchive:
         self._round_edge_keys = []
         self._round_costs = []
         self._online_statistics_cache = {}
+
+    def _rebuild_unique_storage(self, paths, costs, rounds):
+        """Replace compact unique-tour storage and rebuild dedupe locations."""
+        self._paths = [paths]
+        self._costs = [costs]
+        self._rounds = [rounds]
+        self._tour_locations = {}
+        if not self.deduplicate:
+            return
+        key_tours = paths.to(device="cpu", dtype=torch.int32).contiguous()
+        for row_index, row in enumerate(key_tours):
+            self._tour_locations[row.numpy().tobytes()] = (0, row_index)
+
+    def _enforce_limits(self):
+        """Bound raw round history and unique full-tour storage."""
+        history_trimmed = False
+        if (
+            self.max_rounds is not None
+            and len(self._round_edge_keys) > self.max_rounds
+        ):
+            overflow = len(self._round_edge_keys) - self.max_rounds
+            del self._round_edge_keys[:overflow]
+            del self._round_costs[:overflow]
+            history_trimmed = True
+
+        if not self._paths:
+            if history_trimmed:
+                self._online_statistics_cache.clear()
+            return
+
+        paths, costs, rounds = self.tensors()
+        selection = torch.arange(paths.size(0), device=paths.device)
+        if self.max_rounds is not None:
+            first_retained_round = max(self._next_round - self.max_rounds, 0)
+            selection = selection.index_select(
+                0,
+                torch.nonzero(
+                    rounds.index_select(0, selection) >= first_retained_round,
+                    as_tuple=False,
+                ).flatten(),
+            )
+
+        if (
+            self.max_solutions is not None
+            and selection.numel() > self.max_solutions
+        ):
+            selected_costs = costs.index_select(0, selection.to(costs.device))
+            selected_rounds = rounds.index_select(0, selection.to(rounds.device))
+            weights = compute_quality_weights(
+                selected_costs,
+                selected_rounds,
+                num_rounds=self._next_round,
+            )
+            keep = torch.topk(
+                weights,
+                k=self.max_solutions,
+                largest=True,
+                sorted=True,
+            ).indices.to(selection.device)
+            selection = selection.index_select(0, keep)
+
+        if selection.numel() != paths.size(0) or history_trimmed:
+            self._rebuild_unique_storage(
+                paths.index_select(0, selection),
+                costs.index_select(0, selection.to(costs.device)),
+                rounds.index_select(0, selection.to(rounds.device)),
+            )
+            self._online_statistics_cache.clear()
 
     def __len__(self):
         return sum(paths.size(0) for paths in self._paths)
@@ -160,6 +236,7 @@ class SolutionArchive:
                     observation_costs.to(device="cpu", dtype=torch.float32)
                 )
                 self._next_round += 1
+                self._enforce_limits()
                 return {"added": 0, "duplicates": paths.size(1)}
 
             selection = torch.tensor(new_indices, device=tours.device)
@@ -205,6 +282,7 @@ class SolutionArchive:
             for row_index, key in enumerate(new_keys):
                 self._tour_locations[key] = (chunk_index, row_index)
         self._next_round += 1
+        self._enforce_limits()
         return {
             "added": tours.size(0),
             "duplicates": paths.size(1) - tours.size(0),
@@ -370,6 +448,8 @@ class InstanceSearchState:
         initial_heatmap,
         archive_device=None,
         archive_path_dtype=None,
+        archive_max_solutions=256,
+        archive_max_rounds=10,
     ):
         if initial_heatmap.dim() != 2:
             raise ValueError("initial heatmap must be a matrix")
@@ -382,35 +462,13 @@ class InstanceSearchState:
             n_nodes=initial_heatmap.size(0),
             storage_device=archive_device,
             path_dtype=archive_path_dtype,
+            max_solutions=archive_max_solutions,
+            max_rounds=archive_max_rounds,
         )
         self.round_index = 0
 
     def add_feasible_solutions(self, paths, costs):
         self.archive.add(paths, costs)
-
-    def reanchor(self, model_heatmap, memory_strength=0.0):
-        """Fuse the latest model H0 into this instance's persistent heatmap.
-
-        The archive remains untouched.  Re-anchoring closes the training loop:
-        parameter improvements can influence the next population instead of
-        merely imitating a search trajectory created by an early checkpoint.
-        """
-        if not 0 <= memory_strength <= 1:
-            raise ValueError("memory strength must be between 0 and 1")
-        if model_heatmap.shape != self.current_heatmap.shape:
-            raise ValueError("model heatmap shape must match the current heatmap")
-
-        model_heatmap = model_heatmap.detach().to(
-            device=self.current_heatmap.device,
-            dtype=self.current_heatmap.dtype,
-        )
-        model_heatmap = normalize_heatmap_rows(model_heatmap)
-        memory_heatmap = normalize_heatmap_rows(self.current_heatmap.detach())
-        self.current_heatmap = normalize_heatmap_rows(
-            (1.0 - memory_strength) * model_heatmap
-            + memory_strength * memory_heatmap
-        )
-        return self.current_heatmap
 
     def advance(self, next_heatmap):
         if next_heatmap.shape != self.current_heatmap.shape:
@@ -772,4 +830,83 @@ def future_solution_quality_kl(predicted_heatmap, future_target_heatmap):
     return rowwise_heatmap_kl(
         predicted_heatmap,
         future_target_heatmap.detach(),
+    )
+
+
+def population_quality_heatmap(
+    paths,
+    costs,
+    temperature=0.75,
+    elite_ratio=0.25,
+    uniform_mix=0.01,
+):
+    """Build a detached edge target from one actual ACO population."""
+    if paths.dim() != 2:
+        raise ValueError("population paths must have shape [n_nodes, n_ants]")
+    if costs.dim() != 1 or costs.numel() != paths.size(1):
+        raise ValueError("population costs must match the number of paths")
+    if not 0 < elite_ratio <= 1:
+        raise ValueError("elite ratio must be in (0, 1]")
+
+    elite_count = max(
+        1,
+        int(torch.ceil(torch.tensor(costs.numel() * elite_ratio))),
+    )
+    elite_indices = torch.topk(
+        costs,
+        k=elite_count,
+        largest=False,
+        sorted=False,
+    ).indices
+    elite_paths = paths.index_select(1, elite_indices.to(paths.device))
+    elite_costs = costs.index_select(0, elite_indices.to(costs.device))
+    weights = compute_quality_weights(
+        elite_costs,
+        torch.zeros_like(elite_costs, dtype=torch.long),
+        num_rounds=1,
+        temperature=temperature,
+        age_decay=0.0,
+        uniform_mix=uniform_mix,
+    ).to(device=paths.device, dtype=torch.float32)
+
+    n_nodes = paths.size(0)
+    tours = elite_paths.transpose(0, 1).to(dtype=torch.long)
+    u = tours
+    v = torch.roll(tours, shifts=-1, dims=1)
+    edge_weights = weights.repeat_interleave(n_nodes)
+    target = edge_weights.new_zeros((n_nodes, n_nodes))
+    target.index_put_(
+        (u.reshape(-1), v.reshape(-1)),
+        edge_weights,
+        accumulate=True,
+    )
+    target.index_put_(
+        (v.reshape(-1), u.reshape(-1)),
+        edge_weights,
+        accumulate=True,
+    )
+    return normalize_heatmap_rows(target).detach()
+
+
+def population_quality_kl(
+    predicted_heatmap,
+    paths,
+    costs,
+    temperature=0.75,
+    elite_ratio=0.25,
+    uniform_mix=0.01,
+    support_mask=None,
+):
+    """Supervise a sampling heatmap from the real costs it produced."""
+    target = population_quality_heatmap(
+        paths,
+        costs,
+        temperature=temperature,
+        elite_ratio=elite_ratio,
+        uniform_mix=uniform_mix,
+    ).to(device=predicted_heatmap.device, dtype=predicted_heatmap.dtype)
+    return rowwise_heatmap_kl(
+        predicted_heatmap,
+        target,
+        support_mask=support_mask,
     )

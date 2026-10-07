@@ -10,6 +10,8 @@ from solution_graph import (
     normalize_heatmap_rows,
 )
 
+REFINEMENT_MODES = ("h0", "deterministic", "learned", "full")
+
 # GNN for edge embeddings
 class EmbNet(nn.Module):
     def __init__(self, depth=12, feats=1, units=32, act_fn='silu', agg_fn='mean'):
@@ -221,36 +223,46 @@ class Net(nn.Module):
         propagation_strength=0.1,
         distance_prior_strength=0.1,
         max_solutions=128,
+        refinement_mode="full",
         return_components=False,
     ):
         """Combine deterministic aggregation with a learned bounded residual."""
+        if refinement_mode not in REFINEMENT_MODES:
+            raise ValueError(f"unknown refinement mode: {refinement_mode}")
         # The search state is deliberately detached.  H0 distillation updates
         # the initial GNN, while future-quality supervision updates this graph
         # network through the residual only.
         current_heatmap = current_heatmap.detach()
         distances = distances.detach()
-        base_heatmap = graph_refined_heatmap(
-            current_heatmap,
-            archive,
-            distances=distances,
-            temperature=quality_temperature,
-            age_decay=age_decay,
-            uniform_mix=uniform_mix,
-            elite_ratio=elite_ratio,
-            prior_strength=prior_strength,
-            propagation_strength=propagation_strength,
-            distance_prior_strength=distance_prior_strength,
-        )
-        graph = build_learnable_solution_graph(
-            current_heatmap,
-            distances,
-            archive,
-            max_solutions=max_solutions,
-            temperature=quality_temperature,
-            age_decay=age_decay,
-            uniform_mix=uniform_mix,
-        )
-        residual = self.solution_graph_net(graph)
+        if refinement_mode in {"deterministic", "full"}:
+            base_heatmap = graph_refined_heatmap(
+                current_heatmap,
+                archive,
+                distances=distances,
+                temperature=quality_temperature,
+                age_decay=age_decay,
+                uniform_mix=uniform_mix,
+                elite_ratio=elite_ratio,
+                prior_strength=prior_strength,
+                propagation_strength=propagation_strength,
+                distance_prior_strength=distance_prior_strength,
+            )
+        else:
+            base_heatmap = normalize_heatmap_rows(current_heatmap)
+
+        graph = None
+        residual = torch.zeros_like(base_heatmap)
+        if refinement_mode in {"learned", "full"}:
+            graph = build_learnable_solution_graph(
+                current_heatmap,
+                distances,
+                archive,
+                max_solutions=max_solutions,
+                temperature=quality_temperature,
+                age_decay=age_decay,
+                uniform_mix=uniform_mix,
+            )
+            residual = self.solution_graph_net(graph)
         refined = normalize_heatmap_rows(base_heatmap.detach() + residual)
         if return_components:
             return refined, base_heatmap.detach(), residual, graph

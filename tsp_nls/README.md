@@ -1,22 +1,27 @@
 ## PHG-ACO: persistent hypergraph-guided ACO for TSP
 
 This variant treats heatmap construction as an iterative, per-instance search
-process.  An instance owns its current heatmap, feasible-solution archive, and
-cumulative solution hypergraph across both inner rounds and later epochs:
+process. An instance owns its current heatmap, feasible-solution archive, and
+cumulative solution hypergraph during one search visit:
 
 ```text
 problem graph -> H0 -> constrained sampling -> solution hypergraph -> H1
               -> constrained sampling -> larger hypergraph -> H2 -> ...
 ```
 
+`graph_rounds` counts heatmap refinements, not ACO populations. With the
+default three refinements, training samples four populations so every heatmap
+is evaluated: `ACO(H0) -> H1 -> ACO(H1) -> H2 -> ACO(H2) -> H3 -> ACO(H3)`.
+The final H3 population is included in the terminal archive used for training.
+
 The initial GNN heatmap is sparse and therefore compresses the candidate
 solution space. A sampler is accessed through the interface in
 `solution_sampler.py`; ACO sampling is used directly and local search is
-disabled. A different constrained decoder can return the same
+disabled by default but available as a matched baseline. A different constrained decoder can return the same
 `SolutionBatch` fields.
 
-Every distinct feasible ACO tour from every round is retained in the
-instance's cumulative solution hypergraph. Cyclic rotations and reversed
+Distinct feasible ACO tours are retained in the bounded visit-local solution
+hypergraph. Cyclic rotations and reversed
 orientations of the same undirected tour are stored once; observing a duplicate
 refreshes its recency instead of multiplying its weight:
 
@@ -33,8 +38,8 @@ feasible-tour evidence, then applies a bounded residual predicted by a
 learnable solution-graph GNN. The combined `H_(t+1)` becomes the next sampler
 heatmap.
 Only the best-cost `elite_ratio` fraction (default `0.25`) of each newly
-sampled population updates H1. All feasible tours are still retained in the
-archive. Elite tours are explicitly quality-weighted:
+sampled population updates H1. Feasible tours are admitted before bounded
+quality/recency pruning. Elite tours are explicitly quality-weighted:
 
 ```text
 w_i = softmax(-(q_i - q_best) / (temperature * quality_scale))
@@ -55,7 +60,11 @@ support, and the preceding heatmap are row-normalized before convex mixing.
 `--distance_prior_strength` controls the geometric prior; both default to
 `0.1`.
 
-The learned updater selects at most 128 quality-ranked archived tours and runs
+The full visit archive is hard-capped at 256 unique tours and 10 raw sampling
+rounds. Older raw rounds are discarded and the deduplication index plus online
+statistics are rebuilt after pruning, so the underlying archive cannot grow
+without bound. The learned updater selects at most 128 quality-ranked tours
+from that bounded archive and runs
 two sparse edge-to-solution-to-edge message-passing layers. Edge nodes use the
 current heatmap probability, inverse distance, quality support, and occurrence
 frequency. Solution nodes use quality weight, normalized path quality, and
@@ -63,75 +72,85 @@ recency. The output is a symmetric residual bounded to `[-0.25, 0.25]`; its
 final projection is zero-initialized, so a new updater starts exactly from the
 deterministic base heatmap.
 
-Training uses two KL objectives:
+Training uses three KL objectives:
 
 ```text
 L_H0 = weighted_mean_t KL(stopgrad(P_(t+1)) || P_H0)
 L_future = weighted_mean_t KL(stopgrad(P_final_archive) || P_(t+1))
+L_cost = mean_t KL(stopgrad(P_elite_edges_from_actual_ACO_t) || P_t)
 L = kl_weight * L_H0 + future_kl_weight * L_future
+    + path_cost_kl_weight * L_cost
 ```
 
 `P_H0` and `P_(t+1)` are row-normalized heatmap probabilities with self-loops
 and non-trainable padding outside H0's compressed candidate graph masked.
 Every increasingly refined graph heatmap supervises the initial GNN heatmap.
 The standard profile can weight later rounds as `1, 2, ..., graph_rounds`.
-The validated TSP100 fine-tuning profile instead uses equal round weights
-(`kl_round_power=0`), which was more reliable in the k=10 experiments. The
+The legacy TSP100 fine-tuning preset instead uses equal round weights
+(`kl_round_power=0`). It must be revalidated with the revised archive and
+cost-supervision pipeline. The
 first target is detached so `L_H0` updates only the GNN+MLP that produces H0.
 After all rounds, the final archive creates a detached future-quality target;
 `L_future` trains each intermediate learned graph correction to anticipate
-that structure. There is no REINFORCE or entropy loss.
+that structure. `L_cost` evaluates every sampling heatmap, including H0 and
+the terminal H3, against the quality-weighted elite edges from the population
+it actually produced. There is no REINFORCE or entropy loss.
 
-Training uses a fixed persistent instance pool. Every epoch shuffles the pool
-and visits every instance exactly once, with no omission, duplication, or
-replacement. Therefore, an instance participates exactly as many times as the
-number of training epochs. Before every repeat visit, the latest model H0 is
-row-normalized and fused with the stored heatmap:
+The standard training policy uses a fixed coordinate pool. Every epoch
+shuffles the pool and visits every instance exactly once, with no omission,
+duplication, or replacement. Therefore, an instance participates exactly as
+many times as the number of training epochs. Every visit starts from the latest model H0 and an
+empty solution archive, exactly like a fresh test instance. Heatmaps and tours
+accumulate only through the visit-local refinement sequence.
+The standard profile uses 400 fixed coordinates, batch size 20, 20 steps per
+epoch, 20 epochs, and three graph refinements plus a terminal ACO population.
+Each of the 400
+instances therefore participates exactly 20 times.
+Pool coordinates and visit-local compressed archive paths are kept on CPU;
+only the current optimizer batch is materialized on the training device.
+States are never shared between visits or different TSP instances.
 
-```text
-H_start = (1 - state_memory_strength) * H0_new
-          + state_memory_strength * H_memory
+Coordinate-pool overfitting can be measured with three matched policies:
+
+```raw
+$ python3 train.py 100 --train_pool_mode fixed
+$ python3 train.py 100 --train_pool_mode refresh
+$ python3 train.py 100 --train_pool_mode mixed --pool_refresh_fraction 0.5
 ```
 
-The default memory strength is `0`, so the historical heatmap is discarded
-and `H_start = normalize(H0_new)`. The cumulative solution archive remains
-available to the graph updater, and inner-round heatmaps still evolve through
-the normal `H0 -> H1 -> H2` refinement sequence.
-The standard profile uses 400 persistent instances, batch size 20, 20 steps
-per epoch, 20 epochs, and three graph-refinement rounds. Each of the 400
-instances therefore participates exactly 20 times.
-Pool coordinates, persistent heatmaps, and compressed archive paths are kept
-on CPU; only the current optimizer batch is materialized on the training
-device. States are never shared between different TSP instances.
+All policies still visit exactly 400 instances per epoch. `fixed` repeats the
+same coordinates, `refresh` replaces all coordinates after each epoch, and
+`mixed` replaces the requested fraction while retaining the rest.
 
 Testing executes the same sampling, archive, hypergraph aggregation, and
 heatmap-update loop under `torch.no_grad()`.  It does not compute KL, call
-backward, or update model parameters. ACO, the archive, and persistent
+backward, or update model parameters. ACO, the archive, and visit-local
 heatmaps remain on CPU. H0 and the learned solution-graph residual run on the
-model device. No NLS or 2-opt improvement is applied.
+model device. No NLS or 2-opt improvement is applied by default; either can
+be enabled explicitly for matched comparisons.
 Tour construction uses the seed-controlled PyTorch sampler by default. The
 optional `--sampling_backend numba` selects the original inference constructor; it can
 be faster at larger scales, but its thread-local random stream is not strictly
 reproducible and its thread-pool overhead made TSP50 slower in measurement.
-Action log-probabilities are skipped because neither KL objective consumes
+Action log-probabilities are skipped because none of the KL objectives consumes
 them.
 
 ### Training
 
 The checkpoints will be saved in [`../pretrained/tsp_nls`](../pretrained/tsp_nls) with suffix `-best.pt` and `-last.pt` by default.
 
-Recommended TSP100 fine-tuning experiment:
+TSP100 fine-tuning preset:
 ```raw
 $ python3 train.py 100 --profile tsp100_finetune
 ```
 
 This explicit profile starts from `../pretrained/tsp_nls/tsp100-best.pt` and
-uses the measured configuration: `k_sparse=10`, `lr=1e-4`, 3 epochs, 48 ants,
-3 graph rounds, 5 validation rounds, a fixed pool of 400 instances, and
+uses `k_sparse=10`, `lr=1e-4`, 3 epochs, 48 ants,
+3 graph refinements (4 ACO populations), 5 validation rounds, a fixed pool of 400 instances, and
 equal KL weights across graph rounds. It writes checkpoints to
 `../pretrained/tsp_nls/optimized_v3_k10_finetune`. Individual command-line
 flags still override profile values. The profile is deliberately restricted
-to TSP100 because the same defaults have not been validated at other scales.
+to TSP100, but the revised pipeline still requires multi-seed validation.
 
 TSP200:
 ```raw
@@ -148,17 +167,19 @@ TSP1000:
 $ python3 train.py 1000 --graph_rounds 3 --kl_weight 1.0
 ```
 
-`--graph_rounds` controls how many new ant populations are added on each visit
-to a training instance. `--train_pool_size` controls the fixed pool size,
+`--graph_rounds` controls the number of heatmap refinements; training samples
+one additional ACO population so the terminal heatmap is evaluated.
+`--train_pool_size` controls the fixed pool size,
 defaults to 400, and must equal `--steps * --batch_size` so every pool member
 is visited exactly once per epoch.
-`--profile standard` retains the general training defaults.
-`--state_memory_strength` controls H0 re-anchoring and defaults to `0`,
-`--elite_ratio` controls graph-update admission, and `--kl_round_power`
-controls the later-round KL weighting.
-`--future_kl_weight` controls final-archive supervision and
+`--profile standard` retains the general training defaults. `--elite_ratio`
+controls graph-update admission, and `--kl_round_power` controls the
+later-round KL weighting.
+`--future_kl_weight` controls final-archive supervision,
+`--path_cost_kl_weight` controls supervision from actual ACO costs, and
 `--max_solution_graph_solutions` bounds the learned graph to 128 tours by
-default.
+default. `--max_archive_solutions` and `--max_archive_rounds` bound the full
+underlying archive.
 `--validation_rounds` controls validation search depth. `--quality_temperature`,
 `--age_decay`, and `--uniform_mix` control quality weighting.
 `--quality_prior_strength` smooths the quality target with the preceding
@@ -168,6 +189,33 @@ are saved as `tsp{N}-init.pt`; `tsp{N}-best.pt` is atomically replaced only when
 the full run completes. Old DeepACO checkpoints can be supplied with `--pretrained`.
 Missing solution-graph parameters are initialized with a zero output layer, so
 old DeepACO checkpoints start from deterministic heatmap refinement.
+
+Refinement ablations use the same ACO budget and checkpoint interface:
+
+```raw
+$ python3 test.py 100 --refinement_mode h0
+$ python3 test.py 100 --refinement_mode deterministic
+$ python3 test.py 100 --refinement_mode learned
+$ python3 test.py 100 --refinement_mode full
+```
+
+`h0` keeps the original heatmap fixed, `deterministic` uses only fixed archive
+aggregation, `learned` applies only the learned residual over the current
+heatmap, and `full` combines deterministic aggregation with that residual.
+The `h0` mode is evaluation-only; the other modes can be trained separately.
+
+Local search is an explicit matched-baseline option and remains disabled by
+default:
+
+```raw
+$ python3 test.py 100 --refinement_mode h0 --local_search none
+$ python3 test.py 100 --refinement_mode full --local_search none
+$ python3 test.py 100 --refinement_mode h0 --local_search nls
+$ python3 test.py 100 --refinement_mode full --local_search nls
+```
+
+The same `--local_search none|2opt|nls` option is available in `train.py`, so
+baseline and PHG-ACO checkpoints can be trained with matched search settings.
 
 ### Testing
 

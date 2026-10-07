@@ -9,6 +9,8 @@ from solution_graph import (
     SolutionArchive,
     compute_quality_weights,
     graph_refined_heatmap,
+    population_quality_heatmap,
+    population_quality_kl,
     quality_target_heatmap,
     refinement_distillation_kl,
 )
@@ -60,6 +62,48 @@ class SolutionGraphTest(unittest.TestCase):
         graph = archive.build_incidence()
         self.assertEqual(graph["edge_u"].dtype, torch.int64)
         self.assertEqual(graph["edge_incidence"].numel(), 5)
+
+    def test_archive_enforces_unique_solution_limit(self):
+        archive = SolutionArchive(n_nodes=5, max_solutions=2, max_rounds=10)
+        archive.add(
+            torch.tensor(
+                [
+                    [0, 0, 0],
+                    [1, 1, 2],
+                    [2, 3, 4],
+                    [3, 2, 1],
+                    [4, 4, 3],
+                ]
+            ),
+            torch.tensor([5.0, 6.0, 7.0]),
+        )
+
+        _, costs, _ = archive.tensors()
+        self.assertEqual(len(archive), 2)
+        self.assertEqual(sorted(costs.tolist()), [5.0, 6.0])
+
+    def test_archive_enforces_round_limit_and_rebuilds_statistics(self):
+        archive = SolutionArchive(n_nodes=5, max_solutions=10, max_rounds=2)
+        populations = [
+            [0, 1, 2, 3, 4],
+            [0, 1, 3, 2, 4],
+            [0, 2, 1, 4, 3],
+        ]
+        for cost, population in enumerate(populations, start=5):
+            archive.add(
+                torch.tensor(population).unsqueeze(1),
+                torch.tensor([float(cost)]),
+            )
+            archive.online_edge_statistics()
+
+        _, _, rounds = archive.tensors()
+        direct, propagated = archive.online_edge_statistics()
+        self.assertEqual(archive.num_rounds, 3)
+        self.assertEqual(len(archive._round_edge_keys), 2)
+        self.assertEqual(len(archive), 2)
+        self.assertEqual(rounds.min().item(), 1)
+        self.assertTrue(torch.isfinite(direct).all())
+        self.assertTrue(torch.isfinite(propagated).all())
 
     def test_archive_deduplicates_rotated_and_reversed_tours(self):
         archive = SolutionArchive(n_nodes=5)
@@ -196,7 +240,42 @@ class SolutionGraphTest(unittest.TestCase):
         # Edge (0, 1) occurs only in the lower-cost tour, whereas edge (0, 2)
         # occurs only in the higher-cost tour.
         self.assertGreater(float(target[0, 1]), float(target[0, 2]))
+
+    def test_population_cost_target_favors_the_better_actual_tour(self):
+        paths = torch.tensor(
+            [
+                [0, 0],
+                [1, 2],
+                [2, 1],
+                [3, 4],
+                [4, 3],
+            ]
+        )
+        costs = torch.tensor([5.0, 8.0])
+        target = population_quality_heatmap(
+            paths,
+            costs,
+            elite_ratio=0.5,
+        )
+
+        self.assertGreater(float(target[0, 1]), float(target[0, 2]))
+        self.assertTrue(
+            torch.allclose(target.sum(dim=-1), torch.ones(5), atol=1e-6)
+        )
         self.assertTrue(torch.isfinite(target).all())
+
+    def test_population_cost_loss_updates_sampling_heatmap_only(self):
+        predicted = (torch.rand(5, 5) + 0.1).requires_grad_()
+        paths = torch.tensor([[0], [1], [2], [3], [4]])
+        costs = torch.tensor([5.0])
+
+        loss = population_quality_kl(predicted, paths, costs)
+        loss.backward()
+
+        self.assertIsNotNone(predicted.grad)
+        self.assertGreater(float(predicted.grad.abs().sum()), 0.0)
+        self.assertFalse(paths.requires_grad)
+        self.assertFalse(costs.requires_grad)
 
     def test_elite_filter_excludes_non_elite_tour_edges(self):
         archive = SolutionArchive(n_nodes=5)

@@ -1,10 +1,26 @@
 import unittest
 
 import test as test_entrypoint
-from train import resolve_training_profile
+from train import (
+    pool_refresh_fraction_for_mode,
+    resolve_training_profile,
+    sampling_rounds_for_refinements,
+)
 
 
 class TrainingProfileTest(unittest.TestCase):
+    def test_each_refined_heatmap_gets_an_aco_population(self):
+        self.assertEqual(sampling_rounds_for_refinements(3), 4)
+        with self.assertRaises(ValueError):
+            sampling_rounds_for_refinements(0)
+
+    def test_pool_modes_resolve_expected_refresh_fraction(self):
+        self.assertEqual(pool_refresh_fraction_for_mode("fixed"), 0.0)
+        self.assertEqual(pool_refresh_fraction_for_mode("refresh"), 1.0)
+        self.assertEqual(pool_refresh_fraction_for_mode("mixed", 0.25), 0.25)
+        with self.assertRaises(ValueError):
+            pool_refresh_fraction_for_mode("unknown")
+
     def test_standard_profile_uses_one_epoch_sized_training_pool(self):
         resolved = resolve_training_profile(100, "standard")
 
@@ -13,7 +29,7 @@ class TrainingProfileTest(unittest.TestCase):
         self.assertEqual(resolved["train_pool_size"], 400)
         self.assertEqual(resolved["kl_round_power"], 1.0)
 
-    def test_tsp100_finetune_profile_matches_validated_experiment(self):
+    def test_tsp100_finetune_profile_matches_legacy_preset(self):
         resolved = resolve_training_profile(100, "tsp100_finetune")
 
         self.assertEqual(resolved["lr"], 1e-4)

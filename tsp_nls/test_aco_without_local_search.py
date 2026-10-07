@@ -44,6 +44,17 @@ class ACOWithoutLocalSearchTest(unittest.TestCase):
 
         self.assertIsNone(sampler._aco.local_search_type)
 
+    def test_solution_sampler_accepts_explicit_matched_baseline(self):
+        sampler = ACOSolutionSampler(
+            n_solutions=4,
+            heatmap=self.heatmap,
+            distances=self.distances,
+            device="cpu",
+            local_search="nls",
+        )
+
+        self.assertEqual(sampler._aco.local_search_type, "nls")
+
 
 if __name__ == "__main__":
     unittest.main()

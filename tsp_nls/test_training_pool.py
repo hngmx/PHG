@@ -5,6 +5,7 @@ import torch
 from training_pool import (
     create_training_pool,
     iter_pool_batches,
+    refresh_training_pool,
 )
 
 
@@ -34,9 +35,9 @@ class PersistentTrainingPoolTest(unittest.TestCase):
 
         self.assertEqual([instance.visits for instance in pool], [4] * 6)
 
-    def test_instance_discards_old_heatmap_but_reuses_archive(self):
+    def test_instance_starts_each_visit_with_an_empty_archive(self):
         instance = create_training_pool(count=1, n_nodes=5)[0]
-        first_state = instance.get_or_create_state(torch.ones(5, 5))
+        first_state = instance.start_visit(torch.ones(5, 5))
         first_state.add_feasible_solutions(
             torch.tensor([[0], [1], [2], [3], [4]]),
             torch.tensor([5.0]),
@@ -46,24 +47,16 @@ class PersistentTrainingPoolTest(unittest.TestCase):
 
         latest_h0 = torch.ones(5, 5) - torch.eye(5)
         latest_h0[0, 1] = 4.0
-        second_state = instance.get_or_create_state(latest_h0)
+        second_state = instance.start_visit(latest_h0)
 
-        self.assertIs(second_state, first_state)
+        self.assertIsNot(second_state, first_state)
         self.assertEqual(instance.visits, 1)
-        self.assertEqual(len(second_state.archive), 1)
-        self.assertEqual(second_state.archive.num_rounds, 1)
-        expected = latest_h0 / latest_h0.sum(dim=-1, keepdim=True)
-        self.assertTrue(torch.allclose(second_state.current_heatmap, expected))
+        self.assertEqual(len(second_state.archive), 0)
+        self.assertEqual(second_state.archive.num_rounds, 0)
+        self.assertTrue(torch.equal(second_state.current_heatmap, latest_h0))
         self.assertGreater(
             float(second_state.current_heatmap[0, 1]),
             float(second_state.current_heatmap[0, 2]),
-        )
-        self.assertTrue(
-            torch.allclose(
-                second_state.current_heatmap.sum(dim=-1),
-                torch.ones(5),
-                atol=1e-6,
-            )
         )
         self.assertFalse(second_state.current_heatmap.requires_grad)
         self.assertEqual(second_state.current_heatmap.device.type, "cpu")
@@ -74,6 +67,37 @@ class PersistentTrainingPoolTest(unittest.TestCase):
             list(iter_pool_batches(pool, steps=1, batch_size=3))
         with self.assertRaises(ValueError):
             list(iter_pool_batches(pool, steps=1, batch_size=1))
+
+    def test_pool_refresh_modes_replace_exact_fraction(self):
+        pool = create_training_pool(count=6, n_nodes=5)
+        original_instances = list(pool)
+
+        self.assertEqual(refresh_training_pool(pool, fraction=0.0), 0)
+        self.assertTrue(
+            all(
+                instance is original
+                for instance, original in zip(pool, original_instances)
+            )
+        )
+
+        self.assertEqual(refresh_training_pool(pool, fraction=0.5), 3)
+        changed = sum(
+            instance is not original
+            for instance, original in zip(pool, original_instances)
+        )
+        self.assertEqual(changed, 3)
+
+        instances_before_full_refresh = list(pool)
+        self.assertEqual(refresh_training_pool(pool, fraction=1.0), 6)
+        self.assertTrue(
+            all(
+                instance is not original
+                for instance, original in zip(
+                    pool,
+                    instances_before_full_refresh,
+                )
+            )
+        )
 
 
 if __name__ == "__main__":

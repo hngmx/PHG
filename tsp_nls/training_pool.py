@@ -11,7 +11,7 @@ from utils import gen_pyg_data
 
 @dataclass
 class PersistentTrainingInstance:
-    """One fixed TSP instance and its graph/heatmap history across epochs."""
+    """One fixed TSP instance with visit-local search state."""
 
     coordinates: torch.Tensor
     state: Optional[InstanceSearchState] = None
@@ -37,21 +37,22 @@ class PersistentTrainingInstance:
             start_node=0,
         )
 
-    def get_or_create_state(self, initial_heatmap, memory_strength=0.0):
-        """Return persistent state re-anchored by the latest model H0."""
-        if self.state is None:
-            self.state = InstanceSearchState(
-                initial_heatmap.detach().cpu(),
-                archive_device="cpu",
-                archive_path_dtype=torch.int32,
-            )
-        elif self.state.current_heatmap.shape != initial_heatmap.shape:
-            raise ValueError("persistent heatmap shape does not match the instance")
-        else:
-            self.state.reanchor(
-                initial_heatmap.detach().cpu(),
-                memory_strength=memory_strength,
-            )
+    def start_visit(
+        self,
+        initial_heatmap,
+        archive_max_solutions=256,
+        archive_max_rounds=10,
+    ):
+        """Start from H0 and an empty archive, matching fresh test instances."""
+        if initial_heatmap.shape != (self.n_nodes, self.n_nodes):
+            raise ValueError("initial heatmap shape does not match the instance")
+        self.state = InstanceSearchState(
+            initial_heatmap.detach().cpu(),
+            archive_device="cpu",
+            archive_path_dtype=torch.int32,
+            archive_max_solutions=archive_max_solutions,
+            archive_max_rounds=archive_max_rounds,
+        )
         return self.state
 
     def finish_visit(self):
@@ -64,6 +65,23 @@ def create_training_pool(count, n_nodes):
         raise ValueError("training pool size must be positive")
     coordinates = torch.rand((count, n_nodes, 2), device="cpu")
     return [PersistentTrainingInstance(item) for item in coordinates]
+
+
+def refresh_training_pool(pool, fraction):
+    """Replace a controlled fraction of coordinates before a new epoch."""
+    if not pool:
+        raise ValueError("training pool cannot be empty")
+    if not 0 <= fraction <= 1:
+        raise ValueError("pool refresh fraction must be between 0 and 1")
+    replace_count = int(round(len(pool) * fraction))
+    if replace_count == 0:
+        return 0
+
+    indices = torch.randperm(len(pool))[:replace_count].tolist()
+    n_nodes = pool[0].n_nodes
+    for index in indices:
+        pool[index] = PersistentTrainingInstance(torch.rand(n_nodes, 2))
+    return replace_count
 
 
 def iter_pool_batches(pool, steps, batch_size):

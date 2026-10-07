@@ -3,7 +3,11 @@ import unittest
 import torch
 
 from net import Net
-from solution_graph import SolutionArchive, future_solution_quality_kl
+from solution_graph import (
+    SolutionArchive,
+    future_solution_quality_kl,
+    normalize_heatmap_rows,
+)
 
 
 class LearnableSolutionGraphTest(unittest.TestCase):
@@ -78,6 +82,58 @@ class LearnableSolutionGraphTest(unittest.TestCase):
         )
 
         self.assertLessEqual(float(residual.abs().max()), 0.25 + 1e-7)
+
+    def test_refinement_ablation_modes_separate_components(self):
+        model = Net(solution_graph_hidden=8, solution_graph_layers=2)
+
+        h0, h0_base, h0_residual, h0_graph = model.refine_heatmap(
+            self.previous,
+            self.distances,
+            self.archive,
+            refinement_mode="h0",
+            return_components=True,
+        )
+        deterministic, deterministic_base, deterministic_residual, graph = (
+            model.refine_heatmap(
+                self.previous,
+                self.distances,
+                self.archive,
+                refinement_mode="deterministic",
+                return_components=True,
+            )
+        )
+        learned, learned_base, _, learned_graph = model.refine_heatmap(
+            self.previous,
+            self.distances,
+            self.archive,
+            refinement_mode="learned",
+            return_components=True,
+        )
+
+        normalized_previous = normalize_heatmap_rows(self.previous)
+        self.assertTrue(torch.allclose(h0, normalized_previous))
+        self.assertTrue(torch.allclose(h0_base, normalized_previous))
+        self.assertTrue(torch.equal(h0_residual, torch.zeros_like(h0_residual)))
+        self.assertIsNone(h0_graph)
+        self.assertTrue(torch.allclose(deterministic, deterministic_base))
+        self.assertTrue(
+            torch.equal(
+                deterministic_residual,
+                torch.zeros_like(deterministic_residual),
+            )
+        )
+        self.assertIsNone(graph)
+        self.assertTrue(torch.allclose(learned_base, normalized_previous))
+        self.assertTrue(torch.allclose(learned, normalized_previous))
+        self.assertIsNotNone(learned_graph)
+
+        with self.assertRaises(ValueError):
+            model.refine_heatmap(
+                self.previous,
+                self.distances,
+                self.archive,
+                refinement_mode="unknown",
+            )
 
 
 if __name__ == "__main__":
