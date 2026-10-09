@@ -40,8 +40,8 @@ class PersistentTrainingInstance:
     def start_visit(
         self,
         initial_heatmap,
-        archive_max_solutions=256,
-        archive_max_rounds=10,
+        archive_max_solutions=None,
+        archive_max_rounds=None,
     ):
         """Start from H0 and an empty archive, matching fresh test instances."""
         if initial_heatmap.shape != (self.n_nodes, self.n_nodes):

@@ -9,8 +9,9 @@ equivalent hypergraph incidence representation instead:
     edge node <-> sampled solution (hyperedge)
 
 Two edge nodes are related exactly when they share at least one solution
-hyperedge.  The bounded ``SolutionArchive`` retains quality-ranked recent
-solutions; rotation/reversal duplicates refresh recency in place.
+hyperedge. ``SolutionArchive`` retains unique solutions within one visit;
+rotation/reversal duplicates refresh recency in place. Optional caps can prune
+older rounds or lower-ranked tours.
 """
 
 from __future__ import annotations
@@ -31,8 +32,8 @@ class SolutionArchive:
         storage_device=None,
         path_dtype=None,
         deduplicate=True,
-        max_solutions=256,
-        max_rounds=10,
+        max_solutions=None,
+        max_rounds=None,
     ):
         self.n_nodes = n_nodes
         self.storage_device = (
@@ -455,8 +456,8 @@ class InstanceSearchState:
         initial_heatmap,
         archive_device=None,
         archive_path_dtype=None,
-        archive_max_solutions=256,
-        archive_max_rounds=10,
+        archive_max_solutions=None,
+        archive_max_rounds=None,
     ):
         if initial_heatmap.dim() != 2:
             raise ValueError("initial heatmap must be a matrix")
@@ -543,7 +544,7 @@ def build_learnable_solution_graph(
     previous_heatmap,
     distances,
     archive: SolutionArchive,
-    max_solutions=128,
+    max_solutions=None,
     temperature=0.75,
     age_decay=0.1,
     uniform_mix=0.01,
@@ -552,16 +553,16 @@ def build_learnable_solution_graph(
 
     TSP edges are graph nodes and archived tours are solution nodes.  Incidence
     indices represent the two message-passing directions without materialising
-    an edge clique.  Only the highest quality/recency archive entries are kept
-    so the neural updater has a bounded memory and runtime footprint.
+    an edge clique. All archived tours are used by default; an optional cap
+    selects the highest quality/recency entries when memory must be limited.
     """
-    if max_solutions < 1:
+    if max_solutions is not None and max_solutions < 1:
         raise ValueError("maximum solution-graph size must be positive")
     if distances.shape != previous_heatmap.shape:
         raise ValueError("distance matrix shape must match the heatmap")
 
-    # Rank on the archive's storage device (normally CPU), then transfer only
-    # the bounded selected subset to the neural updater's device.
+    # Rank on the archive's storage device (normally CPU), then transfer the
+    # selected tours to the neural updater's device.
     paths, costs, rounds = archive.tensors()
     paths = paths.to(dtype=torch.long)
     costs = costs.to(dtype=torch.float32)
@@ -575,13 +576,15 @@ def build_learnable_solution_graph(
         uniform_mix=uniform_mix,
     ).to(dtype=previous_heatmap.dtype)
 
-    selected_count = min(int(max_solutions), paths.size(0))
-    selected = torch.topk(
-        all_weights,
-        k=selected_count,
-        largest=True,
-        sorted=True,
-    ).indices
+    if max_solutions is None:
+        selected = torch.arange(paths.size(0), device=paths.device)
+    else:
+        selected = torch.topk(
+            all_weights,
+            k=min(int(max_solutions), paths.size(0)),
+            largest=True,
+            sorted=True,
+        ).indices
     paths = paths.index_select(0, selected).to(previous_heatmap.device)
     costs = costs.index_select(0, selected).to(
         device=previous_heatmap.device,
@@ -821,14 +824,6 @@ def refinement_distillation_kl(previous_heatmap, refined_heatmap):
         previous_heatmap,
         refined_heatmap.detach(),
         support_mask=support_mask,
-    )
-
-
-def future_solution_quality_kl(predicted_heatmap, future_target_heatmap):
-    """Train a graph updater to anticipate the detached final archive target."""
-    return rowwise_heatmap_kl(
-        predicted_heatmap,
-        future_target_heatmap.detach(),
     )
 
 

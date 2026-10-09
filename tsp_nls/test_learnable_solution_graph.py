@@ -5,8 +5,8 @@ import torch
 from net import Net
 from solution_graph import (
     SolutionArchive,
-    future_solution_quality_kl,
     normalize_heatmap_rows,
+    population_quality_kl,
 )
 
 
@@ -53,7 +53,7 @@ class LearnableSolutionGraphTest(unittest.TestCase):
             torch.allclose(refined.sum(dim=-1), torch.ones(5), atol=1e-6)
         )
 
-    def test_future_supervision_updates_graph_output_not_initial_gnn(self):
+    def test_s1_cost_supervision_updates_graph_output_not_initial_gnn(self):
         model = Net(solution_graph_hidden=8, solution_graph_layers=2)
         refined, _, _, _ = model.refine_heatmap(
             self.previous,
@@ -61,8 +61,8 @@ class LearnableSolutionGraphTest(unittest.TestCase):
             self.archive,
             return_components=True,
         )
-        future_target = torch.rand(5, 5) + 0.1
-        loss = future_solution_quality_kl(refined, future_target)
+        paths, costs, _ = self.archive.tensors()
+        loss = population_quality_kl(refined, paths.transpose(0, 1), costs)
         loss.backward()
 
         output_grad = model.solution_graph_net.output.weight.grad

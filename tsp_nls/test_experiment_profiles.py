@@ -5,6 +5,8 @@ import torch
 import test as test_entrypoint
 from train import (
     DEFAULT_GRAPH_ROUNDS,
+    VALIDATION_SAMPLING_ROUNDS,
+    infer_instance as infer_validation_instance,
     population_cost_heatmap,
     pool_refresh_fraction_for_mode,
     refined_population_cost_loss,
@@ -16,11 +18,20 @@ from train import (
 class TrainingProfileTest(unittest.TestCase):
     def test_default_training_uses_one_heatmap_refinement(self):
         self.assertEqual(DEFAULT_GRAPH_ROUNDS, 1)
+        self.assertEqual(VALIDATION_SAMPLING_ROUNDS, 2)
 
     def test_each_refined_heatmap_gets_an_aco_population(self):
-        self.assertEqual(sampling_rounds_for_refinements(3), 4)
+        self.assertEqual(sampling_rounds_for_refinements(1), 2)
         with self.assertRaises(ValueError):
             sampling_rounds_for_refinements(0)
+        with self.assertRaises(ValueError):
+            sampling_rounds_for_refinements(2)
+
+    def test_validation_and_test_reject_h2_rounds(self):
+        with self.assertRaises(ValueError):
+            infer_validation_instance(None, None, None, 48, graph_rounds=3)
+        with self.assertRaises(ValueError):
+            test_entrypoint.infer_instance(None, None, None, 48, [1, 2, 3])
 
     def test_initial_cost_metric_does_not_train_h0(self):
         h0 = torch.rand(4, 4, requires_grad=True)
@@ -62,7 +73,6 @@ class TrainingProfileTest(unittest.TestCase):
         self.assertEqual(resolved["lr"], 3e-4)
         self.assertEqual(resolved["epochs"], 20)
         self.assertEqual(resolved["train_pool_size"], 400)
-        self.assertEqual(resolved["kl_round_power"], 1.0)
 
     def test_tsp100_finetune_profile_matches_legacy_preset(self):
         resolved = resolve_training_profile(100, "tsp100_finetune")
@@ -71,7 +81,6 @@ class TrainingProfileTest(unittest.TestCase):
         self.assertEqual(resolved["epochs"], 3)
         self.assertEqual(resolved["k_sparse"], 10)
         self.assertEqual(resolved["train_pool_size"], 400)
-        self.assertEqual(resolved["kl_round_power"], 0.0)
         self.assertTrue(resolved["pretrained"].endswith("tsp100-best.pt"))
         self.assertTrue(
             resolved["output"].endswith("optimized_v3_k10_finetune")

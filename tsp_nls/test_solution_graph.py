@@ -1,11 +1,11 @@
 import unittest
+from itertools import islice, permutations
 from unittest.mock import patch
 
 import torch
 
 from solution_graph import (
     build_learnable_solution_graph,
-    future_solution_quality_kl,
     InstanceSearchState,
     SolutionArchive,
     compute_quality_weights,
@@ -46,6 +46,19 @@ class SolutionGraphTest(unittest.TestCase):
         self.assertEqual(graph["n_solutions"], 3)
         self.assertEqual(graph["edge_incidence"].numel(), 15)
         self.assertEqual(graph["solution_incidence"].numel(), 15)
+
+    def test_archive_defaults_to_unlimited_tours_and_rounds(self):
+        archive = SolutionArchive(n_nodes=5)
+        self.assertIsNone(archive.max_solutions)
+        self.assertIsNone(archive.max_rounds)
+
+        path = torch.tensor([[0], [1], [2], [3], [4]])
+        for _ in range(11):
+            archive.add(path, torch.tensor([5.0]))
+
+        self.assertEqual(len(archive), 1)
+        self.assertEqual(archive.num_rounds, 11)
+        self.assertEqual(len(archive._round_edge_keys), 11)
 
     def test_archive_can_store_compact_cpu_paths(self):
         archive = SolutionArchive(
@@ -439,15 +452,29 @@ class SolutionGraphTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(graph["edge_features"]).all())
         self.assertTrue(torch.isfinite(graph["solution_features"]).all())
 
-    def test_future_quality_loss_updates_prediction_only(self):
-        prediction = (torch.rand(5, 5) + 0.1).requires_grad_()
-        future_target = (torch.rand(5, 5) + 0.1).requires_grad_()
-        loss = future_solution_quality_kl(prediction, future_target)
-        loss.backward()
+    def test_learnable_graph_defaults_to_all_archived_tours(self):
+        archive = SolutionArchive(n_nodes=8)
+        tours = list(
+            islice(
+                (
+                    (0, *tail)
+                    for tail in permutations(range(1, 8))
+                    if tail[0] < tail[-1]
+                ),
+                257,
+            )
+        )
+        archive.add(
+            torch.tensor(tours).transpose(0, 1),
+            torch.linspace(1.0, 2.0, len(tours)),
+        )
+        previous = torch.ones(8, 8) - torch.eye(8)
+        distances = torch.ones(8, 8) + torch.eye(8)
+        graph = build_learnable_solution_graph(previous, distances, archive)
 
-        self.assertIsNotNone(prediction.grad)
-        self.assertGreater(float(prediction.grad.abs().sum()), 0.0)
-        self.assertIsNone(future_target.grad)
+        self.assertEqual(len(archive), 257)
+        self.assertEqual(graph["n_solutions"], 257)
+        self.assertEqual(graph["solution_incidence"].numel(), 257 * 8)
 
     def test_refinement_distillation_only_updates_previous_heatmap(self):
         previous = (torch.rand(5, 5) + 0.1).requires_grad_()

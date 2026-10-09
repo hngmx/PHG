@@ -10,7 +10,6 @@ import torch
 
 from net import Net, REFINEMENT_MODES
 from solution_graph import (
-    future_solution_quality_kl,
     InstanceSearchState,
     population_quality_kl,
     refinement_distillation_kl,
@@ -25,17 +24,17 @@ from utils import load_val_dataset
 
 
 EPS = 1e-10
-T = 5
 DEFAULT_GRAPH_ROUNDS = 1
+VALIDATION_SAMPLING_ROUNDS = 2
 PRETRAINED_DIR = "../pretrained/tsp_nls"
 TSP100_FINETUNE_PROFILE = "tsp100_finetune"
 
 
 def sampling_rounds_for_refinements(graph_rounds):
-    """Return the ACO populations needed to evaluate every refined heatmap."""
-    if graph_rounds < 1:
-        raise ValueError("graph rounds must be positive")
-    return graph_rounds + 1
+    """The H0 -> H1 visit samples once before and once after refinement."""
+    if graph_rounds != DEFAULT_GRAPH_ROUNDS:
+        raise ValueError("training supports exactly one H0 -> H1 refinement")
+    return VALIDATION_SAMPLING_ROUNDS
 
 
 def population_cost_heatmap(initial_heatmap, graph_predictions, sampling_round):
@@ -73,7 +72,6 @@ def resolve_training_profile(
     epochs=None,
     k_sparse=None,
     train_pool_size=None,
-    kl_round_power=None,
     pretrained=None,
     output=None,
 ):
@@ -91,7 +89,6 @@ def resolve_training_profile(
             "epochs": 3,
             "k_sparse": 10,
             "train_pool_size": 400,
-            "kl_round_power": 0.0,
             "pretrained": os.path.join(PRETRAINED_DIR, "tsp100-best.pt"),
             "output": os.path.join(
                 PRETRAINED_DIR, "optimized_v3_k10_finetune"
@@ -103,7 +100,6 @@ def resolve_training_profile(
             "epochs": 20,
             "k_sparse": None,
             "train_pool_size": 400,
-            "kl_round_power": 1.0,
             "pretrained": None,
             "output": PRETRAINED_DIR,
         }
@@ -113,7 +109,6 @@ def resolve_training_profile(
         "epochs": epochs,
         "k_sparse": k_sparse,
         "train_pool_size": train_pool_size,
-        "kl_round_power": kl_round_power,
         "pretrained": pretrained,
         "output": output,
     }
@@ -157,9 +152,7 @@ def train_instance(
     k_sparse,
     graph_rounds=DEFAULT_GRAPH_ROUNDS,
     kl_weight=1.0,
-    future_kl_weight=1.0,
     path_cost_kl_weight=1.0,
-    kl_round_power=1.0,
     quality_temperature=0.75,
     age_decay=0.1,
     uniform_mix=0.01,
@@ -167,9 +160,9 @@ def train_instance(
     quality_prior_strength=0.5,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
-    max_solution_graph_solutions=128,
-    max_archive_solutions=256,
-    max_archive_rounds=10,
+    max_solution_graph_solutions=None,
+    max_archive_solutions=None,
+    max_archive_rounds=None,
     refinement_mode="full",
     local_search=None,
     sampler_factory=ACOSolutionSampler,
@@ -179,7 +172,6 @@ def train_instance(
     sum_loss = 0.0
     count = 0
     h0_metric_sums = [0.0] * graph_rounds
-    future_metric_sums = [0.0] * graph_rounds
     cost_metric_sums = [0.0] * sampling_rounds_for_refinements(graph_rounds)
     refinement_metric_sum = 0.0
     path_cost_metric_sum = 0.0
@@ -264,63 +256,29 @@ def train_instance(
                 refinement_mode=refinement_mode,
                 return_components=True,
             )
-            # Every increasingly refined heatmap supervises the trainable H0.
+            # H1 supervises the trainable H0.
             # The complete teacher, including the learned residual, is detached
             # by the helper so this loss updates only the initial GNN.
             kl_loss = refinement_distillation_kl(
                 initial_heatmap, refined_heatmap
             )
             h0_round_losses.append(kl_loss)
-            # Inputs to the graph updater are detached search state.  Retaining
-            # this prediction lets the final archive supervise the updater
-            # without sending gradients into H0 or the discrete search.
+            # Inputs to the graph updater are detached search state. Retaining
+            # H1 lets S1's actual costs supervise the updater without sending
+            # gradients into H0 or the discrete search.
             graph_predictions.append(refined_heatmap)
             # The search state outlives this optimizer step.  Keeping it on
             # CPU and detached prevents stale autograd graphs and persistent
             # GPU growth while preserving the instance's heatmap trajectory.
             state.advance(refined_heatmap.detach().cpu())
 
-        future_target = model.deterministic_heatmap(
-            state.current_heatmap.to(model.device),
-            distances,
-            state.archive,
-            quality_temperature=quality_temperature,
-            age_decay=age_decay,
-            uniform_mix=uniform_mix,
-            elite_ratio=elite_ratio,
-            prior_strength=quality_prior_strength,
-            propagation_strength=propagation_strength,
-            distance_prior_strength=distance_prior_strength,
-        )
-        future_round_losses = [
-            future_solution_quality_kl(prediction, future_target)
-            for prediction in graph_predictions
-        ]
-        round_losses = [
-            kl_weight * h0_loss + future_kl_weight * future_loss
-            for h0_loss, future_loss in zip(
-                h0_round_losses,
-                future_round_losses,
-            )
-        ]
-
-        round_weights = torch.arange(
-            1,
-            len(round_losses) + 1,
-            device=initial_heatmap.device,
-            dtype=initial_heatmap.dtype,
-        ).pow(kl_round_power)
-        refinement_loss = (
-            torch.stack(round_losses) * round_weights
-        ).sum() / round_weights.sum().clamp_min(EPS)
+        refinement_loss = kl_weight * h0_round_losses[0]
         # Round 0 is diagnostic-only.  The optimized cost objective starts at
         # H1, so the scalar loss itself also matches the declared H0 objective.
         path_cost_loss = refined_population_cost_loss(path_cost_losses)
         sum_loss += refinement_loss + path_cost_kl_weight * path_cost_loss
         for round_index, loss in enumerate(h0_round_losses):
             h0_metric_sums[round_index] += float(loss.detach())
-        for round_index, loss in enumerate(future_round_losses):
-            future_metric_sums[round_index] += float(loss.detach())
         for round_index, loss in enumerate(path_cost_losses):
             cost_metric_sums[round_index] += float(loss.detach())
         refinement_metric_sum += float(refinement_loss.detach())
@@ -338,7 +296,6 @@ def train_instance(
     return {
         "instances": count,
         "h0": [value / count for value in h0_metric_sums],
-        "future": [value / count for value in future_metric_sums],
         "cost": [value / count for value in cost_metric_sums],
         "refinement_weighted": refinement_metric_sum / count,
         "path_cost_mean": path_cost_metric_sum / count,
@@ -352,7 +309,7 @@ def infer_instance(
     pyg_data,
     distances,
     n_ants,
-    graph_rounds=T,
+    graph_rounds=VALIDATION_SAMPLING_ROUNDS,
     quality_temperature=0.75,
     age_decay=0.1,
     uniform_mix=0.01,
@@ -360,14 +317,16 @@ def infer_instance(
     quality_prior_strength=0.5,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
-    max_solution_graph_solutions=128,
-    max_archive_solutions=256,
-    max_archive_rounds=10,
+    max_solution_graph_solutions=None,
+    max_archive_solutions=None,
+    max_archive_rounds=None,
     refinement_mode="full",
     local_search=None,
     sampler_factory=ACOSolutionSampler,
 ):
     """Solve one instance while retaining its heatmap and graph state."""
+    if graph_rounds != VALIDATION_SAMPLING_ROUNDS:
+        raise ValueError("validation must sample H0 and H1 exactly once each")
     model.eval()
     heu_vec = model(pyg_data)
     initial_heatmap = model.reshape(pyg_data, heu_vec) + EPS
@@ -437,9 +396,7 @@ def train_epoch(
     batch_size=1,
     graph_rounds=DEFAULT_GRAPH_ROUNDS,
     kl_weight=1.0,
-    future_kl_weight=1.0,
     path_cost_kl_weight=1.0,
-    kl_round_power=1.0,
     quality_temperature=0.75,
     age_decay=0.1,
     uniform_mix=0.01,
@@ -447,14 +404,13 @@ def train_epoch(
     quality_prior_strength=0.5,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
-    max_solution_graph_solutions=128,
-    max_archive_solutions=256,
-    max_archive_rounds=10,
+    max_solution_graph_solutions=None,
+    max_archive_solutions=None,
+    max_archive_rounds=None,
     refinement_mode="full",
     local_search=None,
 ):
     h0_metric_sums = [0.0] * graph_rounds
-    future_metric_sums = [0.0] * graph_rounds
     cost_metric_sums = [0.0] * sampling_rounds_for_refinements(graph_rounds)
     refinement_metric_sum = 0.0
     path_cost_metric_sum = 0.0
@@ -473,9 +429,7 @@ def train_epoch(
             k_sparse,
             graph_rounds=graph_rounds,
             kl_weight=kl_weight,
-            future_kl_weight=future_kl_weight,
             path_cost_kl_weight=path_cost_kl_weight,
-            kl_round_power=kl_round_power,
             quality_temperature=quality_temperature,
             age_decay=age_decay,
             uniform_mix=uniform_mix,
@@ -493,8 +447,6 @@ def train_epoch(
         instance_count += batch_count
         for round_index, value in enumerate(batch_metrics["h0"]):
             h0_metric_sums[round_index] += value * batch_count
-        for round_index, value in enumerate(batch_metrics["future"]):
-            future_metric_sums[round_index] += value * batch_count
         for round_index, value in enumerate(batch_metrics["cost"]):
             cost_metric_sums[round_index] += value * batch_count
         refinement_metric_sum += (
@@ -505,7 +457,6 @@ def train_epoch(
 
     return {
         "h0": [value / instance_count for value in h0_metric_sums],
-        "future": [value / instance_count for value in future_metric_sums],
         "cost": [value / instance_count for value in cost_metric_sums],
         "refinement_weighted": refinement_metric_sum / instance_count,
         "path_cost_mean": path_cost_metric_sum / instance_count,
@@ -529,17 +480,6 @@ def write_kl_metrics_csv(file_path, history):
                     {
                         "epoch": epoch,
                         "loss_type": "L_H0",
-                        "round": round_index,
-                        "value": f"{value:.10f}",
-                    }
-                )
-            for round_index, value in enumerate(
-                epoch_metrics["future"], start=1
-            ):
-                writer.writerow(
-                    {
-                        "epoch": epoch,
-                        "loss_type": "L_future",
                         "round": round_index,
                         "value": f"{value:.10f}",
                     }
@@ -574,7 +514,7 @@ def validation(
     n_ants,
     net,
     val_dataset,
-    graph_rounds=T,
+    graph_rounds=VALIDATION_SAMPLING_ROUNDS,
     quality_temperature=0.75,
     age_decay=0.1,
     uniform_mix=0.01,
@@ -582,9 +522,9 @@ def validation(
     quality_prior_strength=0.5,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
-    max_solution_graph_solutions=128,
-    max_archive_solutions=256,
-    max_archive_rounds=10,
+    max_solution_graph_solutions=None,
+    max_archive_solutions=None,
+    max_archive_rounds=None,
     refinement_mode="full",
     local_search=None,
     validation_seed=12345,
@@ -627,11 +567,9 @@ def train(
     pretrained=None,
     savepath="../pretrained/tsp_nls",
     graph_rounds=DEFAULT_GRAPH_ROUNDS,
-    validation_rounds=T,
+    validation_rounds=VALIDATION_SAMPLING_ROUNDS,
     kl_weight=1.0,
-    future_kl_weight=1.0,
     path_cost_kl_weight=1.0,
-    kl_round_power=1.0,
     quality_temperature=0.75,
     age_decay=0.1,
     uniform_mix=0.01,
@@ -640,9 +578,9 @@ def train(
     propagation_strength=0.1,
     distance_prior_strength=0.1,
     train_pool_size=400,
-    max_solution_graph_solutions=128,
-    max_archive_solutions=256,
-    max_archive_rounds=10,
+    max_solution_graph_solutions=None,
+    max_archive_solutions=None,
+    max_archive_rounds=None,
     refinement_mode="full",
     local_search=None,
     train_pool_mode="fixed",
@@ -650,11 +588,18 @@ def train(
     seed=1234,
 ):
     seed_everything(seed)
+    sampling_rounds_for_refinements(graph_rounds)
+    if validation_rounds != VALIDATION_SAMPLING_ROUNDS:
+        raise ValueError("validation must sample H0 and H1 exactly once each")
     if refinement_mode == "h0":
         raise ValueError("h0 refinement mode is evaluation-only")
     if refinement_mode not in REFINEMENT_MODES:
         raise ValueError(f"unknown refinement mode: {refinement_mode}")
-    if max_solution_graph_solutions > max_archive_solutions:
+    if (
+        max_solution_graph_solutions is not None
+        and max_archive_solutions is not None
+        and max_solution_graph_solutions > max_archive_solutions
+    ):
         raise ValueError(
             "learned graph solution limit cannot exceed archive capacity"
         )
@@ -756,9 +701,7 @@ def train(
             batch_size=batch_size,
             graph_rounds=graph_rounds,
             kl_weight=kl_weight,
-            future_kl_weight=future_kl_weight,
             path_cost_kl_weight=path_cost_kl_weight,
-            kl_round_power=kl_round_power,
             quality_temperature=quality_temperature,
             age_decay=age_decay,
             uniform_mix=uniform_mix,
@@ -779,7 +722,6 @@ def train(
             f"epoch {epoch} KL:",
             {
                 "L_H0": epoch_kl_metrics["h0"],
-                "L_future": epoch_kl_metrics["future"],
                 "L_cost": epoch_kl_metrics["cost"],
                 "refinement_weighted": epoch_kl_metrics[
                     "refinement_weighted"
@@ -908,16 +850,13 @@ if __name__ == "__main__":
         "--graph_rounds",
         type=int,
         default=DEFAULT_GRAPH_ROUNDS,
-        help=(
-            "Heatmap refinement count per training visit; training samples "
-            "graph_rounds + 1 ACO populations so the final heatmap is tested"
-        ),
+        help="Fixed at 1: each training visit refines H0 to H1 once",
     )
     parser.add_argument(
         "--validation_rounds",
         type=int,
-        default=T,
-        help="Dynamic graph/ACO rounds used for validation",
+        default=VALIDATION_SAMPLING_ROUNDS,
+        help="Fixed at 2 ACO populations: one from H0 and one from H1",
     )
     parser.add_argument(
         "--kl_weight",
@@ -928,25 +867,10 @@ if __name__ == "__main__":
         help="Weight of KL(detached refined heatmap || H0)",
     )
     parser.add_argument(
-        "--future_kl_weight",
-        type=float,
-        default=1.0,
-        help="Weight of KL(final archive target || intermediate graph prediction)",
-    )
-    parser.add_argument(
         "--path_cost_kl_weight",
         type=float,
         default=1.0,
         help="Weight of KL(actual cost-weighted ACO edges || sampling heatmap)",
-    )
-    parser.add_argument(
-        "--kl_round_power",
-        type=float,
-        default=None,
-        help=(
-            "Power weighting later KL rounds; the TSP100 fine-tuning profile "
-            "uses 0 (equal KL weights)"
-        ),
     )
     parser.add_argument(
         "--quality_temperature",
@@ -996,20 +920,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_solution_graph_solutions",
         type=int,
-        default=128,
-        help="Maximum number of quality-ranked archive tours used by the learned graph updater",
+        default=None,
+        help="Optional learned-graph tour cap; default keeps all archived tours",
     )
     parser.add_argument(
         "--max_archive_solutions",
         type=int,
-        default=256,
-        help="Hard limit on full unique tours retained by each visit archive",
+        default=None,
+        help="Optional cap on unique tours retained by each visit archive",
     )
     parser.add_argument(
         "--max_archive_rounds",
         type=int,
-        default=10,
-        help="Hard limit on raw ACO populations retained by each visit archive",
+        default=None,
+        help="Optional cap on ACO populations retained by each visit archive",
     )
     parser.add_argument(
         "--refinement_mode",
@@ -1045,7 +969,6 @@ if __name__ == "__main__":
             epochs=opt.epochs,
             k_sparse=opt.k_sparse,
             train_pool_size=opt.train_pool_size,
-            kl_round_power=opt.kl_round_power,
             pretrained=opt.pretrained,
             output=opt.output,
         )
@@ -1056,13 +979,14 @@ if __name__ == "__main__":
     opt.epochs = resolved["epochs"]
     opt.k_sparse = resolved["k_sparse"]
     opt.train_pool_size = resolved["train_pool_size"]
-    opt.kl_round_power = resolved["kl_round_power"]
     opt.pretrained = resolved["pretrained"]
     opt.output = resolved["output"]
     opt.local_search = None if opt.local_search == "none" else opt.local_search
 
-    if opt.graph_rounds < 1 or opt.validation_rounds < 1:
-        parser.error("graph rounds must be positive")
+    if opt.graph_rounds != DEFAULT_GRAPH_ROUNDS:
+        parser.error("--graph_rounds must be 1 (H0 -> H1 only)")
+    if opt.validation_rounds != VALIDATION_SAMPLING_ROUNDS:
+        parser.error("--validation_rounds must be 2 (sample H0 and H1)")
     required_pool_size = opt.steps * opt.batch_size
     if opt.train_pool_size != required_pool_size:
         parser.error(
@@ -1075,12 +999,8 @@ if __name__ == "__main__":
         parser.error("--k_sparse must be in [1, nodes - 1]")
     if opt.kl_weight < 0:
         parser.error("--kl_weight must be non-negative")
-    if opt.future_kl_weight < 0:
-        parser.error("--future_kl_weight must be non-negative")
     if opt.path_cost_kl_weight < 0:
         parser.error("--path_cost_kl_weight must be non-negative")
-    if opt.kl_round_power < 0:
-        parser.error("--kl_round_power must be non-negative")
     if opt.quality_temperature <= 0:
         parser.error("--quality_temperature must be positive")
     if opt.age_decay < 0:
@@ -1095,13 +1015,17 @@ if __name__ == "__main__":
         parser.error("--propagation_strength must be between 0 and 1")
     if not 0 <= opt.distance_prior_strength <= 1:
         parser.error("--distance_prior_strength must be between 0 and 1")
-    if opt.max_solution_graph_solutions < 1:
+    if opt.max_solution_graph_solutions is not None and opt.max_solution_graph_solutions < 1:
         parser.error("--max_solution_graph_solutions must be positive")
-    if opt.max_archive_solutions < 1:
+    if opt.max_archive_solutions is not None and opt.max_archive_solutions < 1:
         parser.error("--max_archive_solutions must be positive")
-    if opt.max_archive_rounds < 1:
+    if opt.max_archive_rounds is not None and opt.max_archive_rounds < 1:
         parser.error("--max_archive_rounds must be positive")
-    if opt.max_solution_graph_solutions > opt.max_archive_solutions:
+    if (
+        opt.max_solution_graph_solutions is not None
+        and opt.max_archive_solutions is not None
+        and opt.max_solution_graph_solutions > opt.max_archive_solutions
+    ):
         parser.error(
             "--max_solution_graph_solutions cannot exceed "
             "--max_archive_solutions"
@@ -1137,8 +1061,6 @@ if __name__ == "__main__":
                 if opt.train_pool_mode == "mixed"
                 else pool_refresh_fraction_for_mode(opt.train_pool_mode)
             ),
-            "kl_round_power": opt.kl_round_power,
-            "future_kl_weight": opt.future_kl_weight,
             "path_cost_kl_weight": opt.path_cost_kl_weight,
             "max_solution_graph_solutions": opt.max_solution_graph_solutions,
             "max_archive_solutions": opt.max_archive_solutions,
@@ -1163,9 +1085,7 @@ if __name__ == "__main__":
         graph_rounds=opt.graph_rounds,
         validation_rounds=opt.validation_rounds,
         kl_weight=opt.kl_weight,
-        future_kl_weight=opt.future_kl_weight,
         path_cost_kl_weight=opt.path_cost_kl_weight,
-        kl_round_power=opt.kl_round_power,
         quality_temperature=opt.quality_temperature,
         age_decay=opt.age_decay,
         uniform_mix=opt.uniform_mix,

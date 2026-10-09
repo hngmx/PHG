@@ -16,6 +16,7 @@ from utils import load_test_dataset
 EPS = 1e-10
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 PRETRAINED_DIR = "../pretrained/tsp_nls"
+EVALUATION_ROUNDS = (1, 2)
 
 
 def default_checkpoint_candidates(nodes):
@@ -44,15 +45,19 @@ def infer_instance(
     quality_prior_strength=0.5,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
-    max_solution_graph_solutions=128,
-    max_archive_solutions=256,
-    max_archive_rounds=10,
+    max_solution_graph_solutions=None,
+    max_archive_solutions=None,
+    max_archive_rounds=None,
     refinement_mode="full",
     local_search=None,
     sampling_backend="torch",
     sampler_factory=ACOSolutionSampler,
 ):
     """Keep one instance's graph and heatmap through all search rounds."""
+    if not evaluation_rounds or any(
+        round_idx not in EVALUATION_ROUNDS for round_idx in evaluation_rounds
+    ):
+        raise ValueError("evaluation rounds must be 1 and/or 2 (H0 and H1)")
     model.eval()
     # ACO remains CPU-resident. H0 and the learned solution-graph residual run
     # on the model device; visit-local search state returns to CPU between
@@ -126,9 +131,9 @@ def test(
     quality_prior_strength=0.5,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
-    max_solution_graph_solutions=128,
-    max_archive_solutions=256,
-    max_archive_rounds=10,
+    max_solution_graph_solutions=None,
+    max_archive_solutions=None,
+    max_archive_rounds=None,
     refinement_mode="full",
     local_search=None,
     sampling_backend="torch",
@@ -173,16 +178,16 @@ def main(
     quality_prior_strength=0.5,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
-    max_solution_graph_solutions=128,
-    max_archive_solutions=256,
-    max_archive_rounds=10,
+    max_solution_graph_solutions=None,
+    max_archive_solutions=None,
+    max_archive_rounds=None,
     refinement_mode="full",
     local_search=None,
     sampling_backend="torch",
     test_size=None,
 ):
     k_sparse = k_sparse or n_node // 10
-    evaluation_rounds = evaluation_rounds or list(range(1, 11))
+    evaluation_rounds = evaluation_rounds or list(EVALUATION_ROUNDS)
     test_list = load_test_dataset(
         n_node, k_sparse, device, start_node=0
     )
@@ -265,8 +270,8 @@ if __name__ == "__main__":
         "--iterations",
         type=int,
         nargs="+",
-        default=list(range(1, 11)),
-        help="ACO/solution-graph rounds at which results are reported",
+        default=list(EVALUATION_ROUNDS),
+        help="Report ACO results after H0 and/or H1 (rounds 1 and 2 only)",
     )
     parser.add_argument(
         "--quality_temperature",
@@ -325,20 +330,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_solution_graph_solutions",
         type=int,
-        default=128,
-        help="Maximum number of quality-ranked archive tours used by the learned graph updater",
+        default=None,
+        help="Optional learned-graph tour cap; default keeps all archived tours",
     )
     parser.add_argument(
         "--max_archive_solutions",
         type=int,
-        default=256,
-        help="Hard limit on full unique tours retained by one test instance",
+        default=None,
+        help="Optional cap on unique tours retained by one test instance",
     )
     parser.add_argument(
         "--max_archive_rounds",
         type=int,
-        default=10,
-        help="Hard limit on raw ACO populations retained by one test instance",
+        default=None,
+        help="Optional cap on ACO populations retained by one test instance",
     )
     parser.add_argument(
         "--refinement_mode",
@@ -364,6 +369,8 @@ if __name__ == "__main__":
         parser.error("all --iterations values must be positive")
     if sorted(set(opt.iterations)) != opt.iterations:
         parser.error("--iterations must be unique and sorted")
+    if any(round_idx not in EVALUATION_ROUNDS for round_idx in opt.iterations):
+        parser.error("--iterations may contain only 1 and/or 2 (H0 and H1)")
     if opt.quality_temperature <= 0:
         parser.error("--quality_temperature must be positive")
     if opt.age_decay < 0:
@@ -382,13 +389,17 @@ if __name__ == "__main__":
         parser.error("--distance_prior_strength must be between 0 and 1")
     if opt.test_size is not None and opt.test_size < 1:
         parser.error("--test_size must be positive")
-    if opt.max_solution_graph_solutions < 1:
+    if opt.max_solution_graph_solutions is not None and opt.max_solution_graph_solutions < 1:
         parser.error("--max_solution_graph_solutions must be positive")
-    if opt.max_archive_solutions < 1:
+    if opt.max_archive_solutions is not None and opt.max_archive_solutions < 1:
         parser.error("--max_archive_solutions must be positive")
-    if opt.max_archive_rounds < 1:
+    if opt.max_archive_rounds is not None and opt.max_archive_rounds < 1:
         parser.error("--max_archive_rounds must be positive")
-    if opt.max_solution_graph_solutions > opt.max_archive_solutions:
+    if (
+        opt.max_solution_graph_solutions is not None
+        and opt.max_archive_solutions is not None
+        and opt.max_solution_graph_solutions > opt.max_archive_solutions
+    ):
         parser.error(
             "--max_solution_graph_solutions cannot exceed "
             "--max_archive_solutions"
