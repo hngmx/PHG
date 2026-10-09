@@ -241,6 +241,50 @@ class SolutionGraphTest(unittest.TestCase):
         # occurs only in the higher-cost tour.
         self.assertGreater(float(target[0, 1]), float(target[0, 2]))
 
+    def test_quality_target_defaults_to_equal_new_and_previous_mix(self):
+        archive = SolutionArchive(n_nodes=5)
+        archive.add(
+            torch.tensor([[0], [1], [2], [3], [4]]),
+            torch.tensor([5.0]),
+        )
+        previous = torch.tensor(
+            [
+                [0.0, 5.0, 1.0, 1.0, 1.0],
+                [1.0, 0.0, 5.0, 1.0, 1.0],
+                [1.0, 1.0, 0.0, 5.0, 1.0],
+                [1.0, 1.0, 1.0, 0.0, 5.0],
+                [5.0, 1.0, 1.0, 1.0, 0.0],
+            ]
+        )
+        equal_mix = quality_target_heatmap(
+            previous,
+            archive,
+            propagation_strength=0.0,
+            distance_prior_strength=0.0,
+        )
+        graph_only = quality_target_heatmap(
+            previous,
+            archive,
+            prior_strength=0.0,
+            propagation_strength=0.0,
+            distance_prior_strength=0.0,
+        )
+        previous_only = quality_target_heatmap(
+            previous,
+            archive,
+            prior_strength=1.0,
+            propagation_strength=0.0,
+            distance_prior_strength=0.0,
+        )
+
+        self.assertTrue(
+            torch.allclose(
+                equal_mix,
+                0.5 * (graph_only + previous_only),
+                atol=1e-6,
+            )
+        )
+
     def test_population_cost_target_favors_the_better_actual_tour(self):
         paths = torch.tensor(
             [

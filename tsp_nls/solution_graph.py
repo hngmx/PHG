@@ -678,7 +678,7 @@ def quality_target_heatmap(
     age_decay=0.1,
     uniform_mix=0.01,
     elite_ratio=0.25,
-    prior_strength=0.05,
+    prior_strength=0.5,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
 ):
@@ -761,7 +761,7 @@ def graph_refined_heatmap(
     age_decay=0.1,
     uniform_mix=0.01,
     elite_ratio=0.25,
-    prior_strength=0.05,
+    prior_strength=0.5,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
 ):

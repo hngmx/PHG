@@ -41,7 +41,7 @@ def infer_instance(
     age_decay=0.1,
     uniform_mix=0.01,
     elite_ratio=0.25,
-    quality_prior_strength=0.05,
+    quality_prior_strength=0.5,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
     max_solution_graph_solutions=128,
@@ -123,7 +123,7 @@ def test(
     age_decay=0.1,
     uniform_mix=0.01,
     elite_ratio=0.25,
-    quality_prior_strength=0.05,
+    quality_prior_strength=0.5,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
     max_solution_graph_solutions=128,
@@ -170,7 +170,7 @@ def main(
     age_decay=0.1,
     uniform_mix=0.01,
     elite_ratio=0.25,
-    quality_prior_strength=0.05,
+    quality_prior_strength=0.5,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
     max_solution_graph_solutions=128,
@@ -295,8 +295,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--quality_prior_strength",
         type=float,
-        default=0.05,
-        help="Previous-heatmap prior used in the graph-refined heatmap",
+        default=0.5,
+        help=(
+            "Previous-heatmap share in the deterministic update; default "
+            "0.5 gives a 1:1 mix with the new graph target"
+        ),
     )
     parser.add_argument(
         "--propagation_strength",

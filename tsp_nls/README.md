@@ -9,10 +9,11 @@ problem graph -> H0 -> constrained sampling -> solution hypergraph -> H1
               -> constrained sampling -> larger hypergraph -> H2 -> ...
 ```
 
-`graph_rounds` counts heatmap refinements, not ACO populations. With the
-default three refinements, training samples four populations so every heatmap
-is evaluated: `ACO(H0) -> H1 -> ACO(H1) -> H2 -> ACO(H2) -> H3 -> ACO(H3)`.
-The final H3 population is included in the terminal archive used for training.
+`graph_rounds` counts heatmap refinements, not ACO populations. The default is
+one refinement, so training samples two populations and evaluates the updated
+heatmap: `ACO(H0) -> H1 -> ACO(H1)`. The H1 population is included in the
+terminal archive used for training. Larger values remain available for later
+multi-round experiments.
 
 The initial GNN heatmap is sparse and therefore compresses the candidate
 solution space. A sampler is accessed through the interface in
@@ -58,7 +59,9 @@ support, propagated support, inverse-distance
 support, and the preceding heatmap are row-normalized before convex mixing.
 `--propagation_strength` controls the second pass and
 `--distance_prior_strength` controls the geometric prior; both default to
-`0.1`.
+`0.1`. `--quality_prior_strength` defaults to `0.5`, so the final
+deterministic update mixes the new graph target and the preceding heatmap at
+`1:1`.
 
 The full visit archive is hard-capped at 256 unique tours and 10 raw sampling
 rounds. Older raw rounds are discarded and the deduplication index plus online
@@ -77,7 +80,7 @@ Training uses three KL objectives:
 ```text
 L_H0 = weighted_mean_t KL(stopgrad(P_(t+1)) || P_H0)
 L_future = weighted_mean_t KL(stopgrad(P_final_archive) || P_(t+1))
-L_cost = mean_t KL(stopgrad(P_elite_edges_from_actual_ACO_t) || P_t)
+L_cost = mean_(t>=1) KL(stopgrad(P_elite_edges_from_actual_ACO_t) || P_t)
 L = kl_weight * L_H0 + future_kl_weight * L_future
     + path_cost_kl_weight * L_cost
 ```
@@ -89,12 +92,17 @@ The standard profile can weight later rounds as `1, 2, ..., graph_rounds`.
 The legacy TSP100 fine-tuning preset instead uses equal round weights
 (`kl_round_power=0`). It must be revalidated with the revised archive and
 cost-supervision pipeline. The
-first target is detached so `L_H0` updates only the GNN+MLP that produces H0.
+first target is detached so `L_H0` is the only objective that updates the
+GNN+MLP producing H0.
 After all rounds, the final archive creates a detached future-quality target;
 `L_future` trains each intermediate learned graph correction to anticipate
-that structure. `L_cost` evaluates every sampling heatmap, including H0 and
-the terminal H3, against the quality-weighted elite edges from the population
-it actually produced. There is no REINFORCE or entropy loss.
+that structure. `L_cost` trains refined heatmaps, including the terminal
+`H_graph_rounds` (H1 by default), against quality-weighted elite edges from
+the population they actually produced. The same statistic is reported for
+H0 only as a detached diagnostic metric, so it cannot send an extra gradient
+to the initial network. With the default `graph_rounds=1`, the initial-network
+path is exactly `H0 -> sample S0 -> build hypergraph -> H1 -> KL(H1 || H0)`.
+There is no REINFORCE or entropy loss.
 
 The standard training policy uses a fixed coordinate pool. Every epoch
 shuffles the pool and visits every instance exactly once, with no omission,
@@ -103,7 +111,7 @@ many times as the number of training epochs. Every visit starts from the latest 
 empty solution archive, exactly like a fresh test instance. Heatmaps and tours
 accumulate only through the visit-local refinement sequence.
 The standard profile uses 400 fixed coordinates, batch size 20, 20 steps per
-epoch, 20 epochs, and three graph refinements plus a terminal ACO population.
+epoch, 20 epochs, and one graph refinement plus a terminal ACO population.
 Each of the 400
 instances therefore participates exactly 20 times.
 Pool coordinates and visit-local compressed archive paths are kept on CPU;
@@ -146,7 +154,7 @@ $ python3 train.py 100 --profile tsp100_finetune
 
 This explicit profile starts from `../pretrained/tsp_nls/tsp100-best.pt` and
 uses `k_sparse=10`, `lr=1e-4`, 3 epochs, 48 ants,
-3 graph refinements (4 ACO populations), 5 validation rounds, a fixed pool of 400 instances, and
+1 graph refinement (2 ACO populations), 5 validation rounds, a fixed pool of 400 instances, and
 equal KL weights across graph rounds. It writes checkpoints to
 `../pretrained/tsp_nls/optimized_v3_k10_finetune`. Individual command-line
 flags still override profile values. The profile is deliberately restricted
@@ -159,12 +167,12 @@ $ python3 train.py 200
 
 TSP500:
 ```raw
-$ python3 train.py 500 --graph_rounds 3 --kl_weight 1.0
+$ python3 train.py 500 --graph_rounds 1 --kl_weight 1.0
 ```
 
 TSP1000:
 ```raw
-$ python3 train.py 1000 --graph_rounds 3 --kl_weight 1.0
+$ python3 train.py 1000 --graph_rounds 1 --kl_weight 1.0
 ```
 
 `--graph_rounds` controls the number of heatmap refinements; training samples
@@ -183,7 +191,8 @@ underlying archive.
 `--validation_rounds` controls validation search depth. `--quality_temperature`,
 `--age_decay`, and `--uniform_mix` control quality weighting.
 `--quality_prior_strength` smooths the quality target with the preceding
-heatmap. `--seed` fixes training and uses an isolated fixed validation seed, so
+heatmap; its default `0.5` gives equal weight to both. `--seed` fixes training
+and uses an isolated fixed validation seed, so
 every checkpoint is evaluated with the same random stream. Epoch-0 parameters
 are saved as `tsp{N}-init.pt`; `tsp{N}-best.pt` is atomically replaced only when
 the full run completes. Old DeepACO checkpoints can be supplied with `--pretrained`.

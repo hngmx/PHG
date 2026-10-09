@@ -1,4 +1,5 @@
 import argparse
+import csv
 from contextlib import contextmanager
 import os
 import random
@@ -25,6 +26,7 @@ from utils import load_val_dataset
 
 EPS = 1e-10
 T = 5
+DEFAULT_GRAPH_ROUNDS = 1
 PRETRAINED_DIR = "../pretrained/tsp_nls"
 TSP100_FINETUNE_PROFILE = "tsp100_finetune"
 
@@ -34,6 +36,20 @@ def sampling_rounds_for_refinements(graph_rounds):
     if graph_rounds < 1:
         raise ValueError("graph rounds must be positive")
     return graph_rounds + 1
+
+
+def population_cost_heatmap(initial_heatmap, graph_predictions, sampling_round):
+    """Detach H0 so only graph distillation trains the initial network."""
+    if sampling_round == 0:
+        return initial_heatmap.detach()
+    return graph_predictions[-1]
+
+
+def refined_population_cost_loss(population_losses):
+    """Average trainable population losses while excluding diagnostic H0."""
+    if len(population_losses) < 2:
+        raise ValueError("H0 plus at least one refined heatmap are required")
+    return torch.stack(population_losses[1:]).mean()
 
 
 def pool_refresh_fraction_for_mode(mode, mixed_fraction=0.5):
@@ -139,7 +155,7 @@ def train_instance(
     data,
     n_ants,
     k_sparse,
-    graph_rounds=3,
+    graph_rounds=DEFAULT_GRAPH_ROUNDS,
     kl_weight=1.0,
     future_kl_weight=1.0,
     path_cost_kl_weight=1.0,
@@ -148,7 +164,7 @@ def train_instance(
     age_decay=0.1,
     uniform_mix=0.01,
     elite_ratio=0.25,
-    quality_prior_strength=0.05,
+    quality_prior_strength=0.5,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
     max_solution_graph_solutions=128,
@@ -162,6 +178,11 @@ def train_instance(
     model.train()
     sum_loss = 0.0
     count = 0
+    h0_metric_sums = [0.0] * graph_rounds
+    future_metric_sums = [0.0] * graph_rounds
+    cost_metric_sums = [0.0] * sampling_rounds_for_refinements(graph_rounds)
+    refinement_metric_sum = 0.0
+    path_cost_metric_sum = 0.0
 
     for training_instance in data:
         pyg_data, distances = training_instance.materialize(k_sparse, device)
@@ -202,10 +223,13 @@ def train_instance(
                 solutions.feasible_paths,
                 solutions.feasible_costs,
             )
-            sampling_prediction = (
-                initial_heatmap
-                if sampling_round == 0
-                else graph_predictions[-1]
+            # S0 constructs the solution hypergraph and H1. Its cost KL stays
+            # visible as a metric, but must not become a second H0 objective:
+            # the initial GNN is trained only by KL(stopgrad(H1) || H0).
+            sampling_prediction = population_cost_heatmap(
+                initial_heatmap,
+                graph_predictions,
+                sampling_round,
             )
             path_cost_losses.append(
                 population_quality_kl(
@@ -289,8 +313,18 @@ def train_instance(
         refinement_loss = (
             torch.stack(round_losses) * round_weights
         ).sum() / round_weights.sum().clamp_min(EPS)
-        path_cost_loss = torch.stack(path_cost_losses).mean()
+        # Round 0 is diagnostic-only.  The optimized cost objective starts at
+        # H1, so the scalar loss itself also matches the declared H0 objective.
+        path_cost_loss = refined_population_cost_loss(path_cost_losses)
         sum_loss += refinement_loss + path_cost_kl_weight * path_cost_loss
+        for round_index, loss in enumerate(h0_round_losses):
+            h0_metric_sums[round_index] += float(loss.detach())
+        for round_index, loss in enumerate(future_round_losses):
+            future_metric_sums[round_index] += float(loss.detach())
+        for round_index, loss in enumerate(path_cost_losses):
+            cost_metric_sums[round_index] += float(loss.detach())
+        refinement_metric_sum += float(refinement_loss.detach())
+        path_cost_metric_sum += float(path_cost_loss.detach())
         count += 1
         training_instance.finish_visit()
 
@@ -301,6 +335,15 @@ def train_instance(
         parameters=model.parameters(), max_norm=3.0, norm_type=2
     )
     optimizer.step()
+    return {
+        "instances": count,
+        "h0": [value / count for value in h0_metric_sums],
+        "future": [value / count for value in future_metric_sums],
+        "cost": [value / count for value in cost_metric_sums],
+        "refinement_weighted": refinement_metric_sum / count,
+        "path_cost_mean": path_cost_metric_sum / count,
+        "total_weighted": float(sum_loss.detach()),
+    }
 
 
 @torch.no_grad()
@@ -314,7 +357,7 @@ def infer_instance(
     age_decay=0.1,
     uniform_mix=0.01,
     elite_ratio=0.25,
-    quality_prior_strength=0.05,
+    quality_prior_strength=0.5,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
     max_solution_graph_solutions=128,
@@ -394,7 +437,7 @@ def train_epoch(
     optimizer,
     training_pool,
     batch_size=1,
-    graph_rounds=3,
+    graph_rounds=DEFAULT_GRAPH_ROUNDS,
     kl_weight=1.0,
     future_kl_weight=1.0,
     path_cost_kl_weight=1.0,
@@ -403,7 +446,7 @@ def train_epoch(
     age_decay=0.1,
     uniform_mix=0.01,
     elite_ratio=0.25,
-    quality_prior_strength=0.05,
+    quality_prior_strength=0.5,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
     max_solution_graph_solutions=128,
@@ -413,12 +456,19 @@ def train_epoch(
     local_search=None,
 ):
     del n_node, epoch
+    h0_metric_sums = [0.0] * graph_rounds
+    future_metric_sums = [0.0] * graph_rounds
+    cost_metric_sums = [0.0] * sampling_rounds_for_refinements(graph_rounds)
+    refinement_metric_sum = 0.0
+    path_cost_metric_sum = 0.0
+    total_metric_sum = 0.0
+    instance_count = 0
     for training_batch in iter_pool_batches(
         training_pool,
         steps=steps_per_epoch,
         batch_size=batch_size,
     ):
-        train_instance(
+        batch_metrics = train_instance(
             net,
             optimizer,
             training_batch,
@@ -442,6 +492,84 @@ def train_epoch(
             refinement_mode=refinement_mode,
             local_search=local_search,
         )
+        batch_count = batch_metrics["instances"]
+        instance_count += batch_count
+        for round_index, value in enumerate(batch_metrics["h0"]):
+            h0_metric_sums[round_index] += value * batch_count
+        for round_index, value in enumerate(batch_metrics["future"]):
+            future_metric_sums[round_index] += value * batch_count
+        for round_index, value in enumerate(batch_metrics["cost"]):
+            cost_metric_sums[round_index] += value * batch_count
+        refinement_metric_sum += (
+            batch_metrics["refinement_weighted"] * batch_count
+        )
+        path_cost_metric_sum += batch_metrics["path_cost_mean"] * batch_count
+        total_metric_sum += batch_metrics["total_weighted"] * batch_count
+
+    return {
+        "h0": [value / instance_count for value in h0_metric_sums],
+        "future": [value / instance_count for value in future_metric_sums],
+        "cost": [value / instance_count for value in cost_metric_sums],
+        "refinement_weighted": refinement_metric_sum / instance_count,
+        "path_cost_mean": path_cost_metric_sum / instance_count,
+        "total_weighted": total_metric_sum / instance_count,
+    }
+
+
+def write_kl_metrics_csv(file_path, history):
+    """Atomically persist per-epoch, per-round KL metrics."""
+    temporary_path = f"{file_path}.{os.getpid()}.tmp"
+    with open(temporary_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=("epoch", "loss_type", "round", "value"),
+        )
+        writer.writeheader()
+        for epoch_metrics in history:
+            epoch = epoch_metrics["epoch"]
+            for round_index, value in enumerate(epoch_metrics["h0"], start=1):
+                writer.writerow(
+                    {
+                        "epoch": epoch,
+                        "loss_type": "L_H0",
+                        "round": round_index,
+                        "value": f"{value:.10f}",
+                    }
+                )
+            for round_index, value in enumerate(
+                epoch_metrics["future"], start=1
+            ):
+                writer.writerow(
+                    {
+                        "epoch": epoch,
+                        "loss_type": "L_future",
+                        "round": round_index,
+                        "value": f"{value:.10f}",
+                    }
+                )
+            for round_index, value in enumerate(epoch_metrics["cost"]):
+                writer.writerow(
+                    {
+                        "epoch": epoch,
+                        "loss_type": "L_cost",
+                        "round": round_index,
+                        "value": f"{value:.10f}",
+                    }
+                )
+            for loss_type in (
+                "refinement_weighted",
+                "path_cost_mean",
+                "total_weighted",
+            ):
+                writer.writerow(
+                    {
+                        "epoch": epoch,
+                        "loss_type": loss_type,
+                        "round": "all",
+                        "value": f"{epoch_metrics[loss_type]:.10f}",
+                    }
+                )
+    os.replace(temporary_path, file_path)
 
 
 @torch.no_grad()
@@ -455,7 +583,7 @@ def validation(
     age_decay=0.1,
     uniform_mix=0.01,
     elite_ratio=0.25,
-    quality_prior_strength=0.05,
+    quality_prior_strength=0.5,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
     max_solution_graph_solutions=128,
@@ -503,7 +631,7 @@ def train(
     test_size=None,
     pretrained=None,
     savepath="../pretrained/tsp_nls",
-    graph_rounds=3,
+    graph_rounds=DEFAULT_GRAPH_ROUNDS,
     validation_rounds=T,
     kl_weight=1.0,
     future_kl_weight=1.0,
@@ -513,7 +641,7 @@ def train(
     age_decay=0.1,
     uniform_mix=0.01,
     elite_ratio=0.25,
-    quality_prior_strength=0.05,
+    quality_prior_strength=0.5,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
     train_pool_size=400,
@@ -613,6 +741,8 @@ def train(
     print("epoch 0:", stats)
 
     sum_time = 0
+    kl_history = []
+    kl_metrics_path = os.path.join(savepath, "kl_metrics.csv")
     for epoch in range(1, epochs + 1):
         if epoch > 1:
             refreshed = refresh_training_pool(
@@ -622,7 +752,7 @@ def train(
             if refreshed:
                 print(f"refreshed training-pool coordinates: {refreshed}")
         start = time.time()
-        train_epoch(
+        epoch_kl_metrics = train_epoch(
             n_node,
             n_ants,
             k_sparse,
@@ -649,6 +779,22 @@ def train(
             max_archive_rounds=max_archive_rounds,
             refinement_mode=refinement_mode,
             local_search=local_search,
+        )
+        epoch_kl_metrics["epoch"] = epoch
+        kl_history.append(epoch_kl_metrics)
+        write_kl_metrics_csv(kl_metrics_path, kl_history)
+        print(
+            f"epoch {epoch} KL:",
+            {
+                "L_H0": epoch_kl_metrics["h0"],
+                "L_future": epoch_kl_metrics["future"],
+                "L_cost": epoch_kl_metrics["cost"],
+                "refinement_weighted": epoch_kl_metrics[
+                    "refinement_weighted"
+                ],
+                "path_cost_mean": epoch_kl_metrics["path_cost_mean"],
+                "total_weighted": epoch_kl_metrics["total_weighted"],
+            },
         )
         sum_time += time.time() - start
         stats = validation(
@@ -689,6 +835,7 @@ def train(
     os.replace(temporary_best_path, best_path)
     print("\ntotal training duration:", sum_time)
     print("best validation epoch:", best_epoch)
+    print("KL metrics:", kl_metrics_path)
     return best_path
 
 
@@ -769,7 +916,7 @@ if __name__ == "__main__":
         "-r",
         "--graph_rounds",
         type=int,
-        default=3,
+        default=DEFAULT_GRAPH_ROUNDS,
         help=(
             "Heatmap refinement count per training visit; training samples "
             "graph_rounds + 1 ACO populations so the final heatmap is tested"
@@ -837,8 +984,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--quality_prior_strength",
         type=float,
-        default=0.05,
-        help="Previous-heatmap prior added to the quality target",
+        default=0.5,
+        help=(
+            "Previous-heatmap share in the deterministic update; default "
+            "0.5 gives a 1:1 mix with the new graph target"
+        ),
     )
     parser.add_argument(
         "--propagation_strength",
