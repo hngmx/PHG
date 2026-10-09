@@ -37,8 +37,6 @@ def gen_pyg_data(tsp_coordinates, k_sparse, start_node = None):
     if start_node is None:
         node_feature = tsp_coordinates
     else:
-        # node_feature = torch.hstack([tsp_coordinates, torch.zeros((n_nodes,1), device=tsp_coordinates.device)])
-        # node_feature[start_node, 2] = 1.0
         node_feature = torch.zeros((n_nodes,1), device=tsp_coordinates.device, dtype=tsp_coordinates.dtype)
         node_feature[start_node, 0] = 1.0
     pyg_data = Data(x=node_feature, edge_index=edge_index, edge_attr=edge_attr)
@@ -58,6 +56,7 @@ def load_val_dataset(n_node, k_sparse, device, start_node = None):
         val_list.append((data, distances))
     return val_list
 
+
 def load_test_dataset(n_node, k_sparse, device, start_node = None, filename = None):
     val_list = []
     filename = filename or f'../data/tsp/testDataset-{n_node}.pt'
@@ -67,6 +66,3 @@ def load_test_dataset(n_node, k_sparse, device, start_node = None, filename = No
         data, distances = gen_pyg_data(instance, k_sparse=k_sparse, start_node = start_node)
         val_list.append((data, distances))
     return val_list
-
-if __name__ == "__main__":
-    pass

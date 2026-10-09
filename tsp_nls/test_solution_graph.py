@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -62,6 +63,23 @@ class SolutionGraphTest(unittest.TestCase):
         graph = archive.build_incidence()
         self.assertEqual(graph["edge_u"].dtype, torch.int64)
         self.assertEqual(graph["edge_incidence"].numel(), 5)
+
+    def test_archive_skips_full_rebuild_while_below_limits(self):
+        archive = SolutionArchive(n_nodes=5, max_solutions=4, max_rounds=3)
+        with patch.object(
+            archive, "tensors", side_effect=AssertionError("unexpected rebuild")
+        ):
+            archive.add(
+                torch.tensor([[0], [1], [2], [3], [4]]),
+                torch.tensor([5.0]),
+            )
+            archive.add(
+                torch.tensor([[0], [1], [3], [2], [4]]),
+                torch.tensor([6.0]),
+            )
+
+        self.assertEqual(len(archive), 2)
+        self.assertEqual(archive.num_rounds, 2)
 
     def test_archive_enforces_unique_solution_limit(self):
         archive = SolutionArchive(n_nodes=5, max_solutions=2, max_rounds=10)

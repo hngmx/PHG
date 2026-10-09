@@ -94,6 +94,13 @@ class SolutionArchive:
                 self._online_statistics_cache.clear()
             return
 
+        # The common case is still below both limits. Avoid concatenating all
+        # archived tours until pruning or a round-history trim is necessary.
+        if not history_trimmed and (
+            self.max_solutions is None or len(self) <= self.max_solutions
+        ):
+            return
+
         paths, costs, rounds = self.tensors()
         selection = torch.arange(paths.size(0), device=paths.device)
         if self.max_rounds is not None:
@@ -475,14 +482,6 @@ class InstanceSearchState:
             raise ValueError("next heatmap shape must match the current heatmap")
         self.current_heatmap = next_heatmap
         self.round_index += 1
-
-
-def _scatter_mean(values, index, output_size):
-    output = values.new_zeros((output_size, values.size(-1)))
-    output.index_add_(0, index, values)
-    counts = values.new_zeros((output_size, 1))
-    counts.index_add_(0, index, values.new_ones((values.size(0), 1)))
-    return output / counts.clamp_min(1.0)
 
 
 def normalize_heatmap_rows(heatmap):

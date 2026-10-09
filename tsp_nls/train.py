@@ -428,10 +428,8 @@ def infer_instance(
 
 
 def train_epoch(
-    n_node,
     n_ants,
     k_sparse,
-    epoch,
     steps_per_epoch,
     net,
     optimizer,
@@ -455,7 +453,6 @@ def train_epoch(
     refinement_mode="full",
     local_search=None,
 ):
-    del n_node, epoch
     h0_metric_sums = [0.0] * graph_rounds
     future_metric_sums = [0.0] * graph_rounds
     cost_metric_sums = [0.0] * sampling_rounds_for_refinements(graph_rounds)
@@ -575,7 +572,6 @@ def write_kl_metrics_csv(file_path, history):
 @torch.no_grad()
 def validation(
     n_ants,
-    epoch,
     net,
     val_dataset,
     graph_rounds=T,
@@ -593,7 +589,6 @@ def validation(
     local_search=None,
     validation_seed=12345,
 ):
-    del epoch
     stats = []
     with isolated_random_seed(validation_seed):
         for data, distances in val_dataset:
@@ -706,7 +701,6 @@ def train(
 
     stats = validation(
         n_ants,
-        -1,
         net,
         val_list,
         graph_rounds=validation_rounds,
@@ -753,10 +747,8 @@ def train(
                 print(f"refreshed training-pool coordinates: {refreshed}")
         start = time.time()
         epoch_kl_metrics = train_epoch(
-            n_node,
             n_ants,
             k_sparse,
-            epoch,
             steps_per_epoch,
             net,
             optimizer,
@@ -799,7 +791,6 @@ def train(
         sum_time += time.time() - start
         stats = validation(
             n_ants,
-            epoch,
             net,
             val_list,
             graph_rounds=validation_rounds,

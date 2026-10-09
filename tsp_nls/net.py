@@ -1,7 +1,6 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from copy import deepcopy
 import torch_geometric.nn as gnn
 
 from solution_graph import (
@@ -30,10 +29,7 @@ class EmbNet(nn.Module):
         self.e_lin0 = nn.Linear(1, self.units)
         self.e_lins0 = nn.ModuleList([nn.Linear(self.units, self.units) for i in range(self.depth)])
         self.e_bns = nn.ModuleList([gnn.BatchNorm(self.units) for i in range(self.depth)])
-    def reset_parameters(self):
-        raise NotImplementedError
     def forward(self, x, edge_index, edge_attr):
-        x = x
         w = edge_attr
         x = self.v_lin0(x)
         x = self.act_fn(x)
