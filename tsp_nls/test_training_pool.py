@@ -22,6 +22,15 @@ class PersistentTrainingPoolTest(unittest.TestCase):
         self.assertEqual(len(visited), 6)
         self.assertEqual(len(set(visited)), 6)
 
+    def test_800_instance_epoch_visits_every_instance_once(self):
+        pool = create_training_pool(count=800, n_nodes=5)
+        batches = list(iter_pool_batches(pool, steps=40, batch_size=20))
+        visited = [id(instance) for batch in batches for instance in batch]
+
+        self.assertEqual(len(batches), 40)
+        self.assertEqual(len(visited), 800)
+        self.assertEqual(len(set(visited)), 800)
+
     def test_same_pool_is_visited_once_per_epoch_for_all_epochs(self):
         pool = create_training_pool(count=6, n_nodes=5)
         expected = {id(instance) for instance in pool}

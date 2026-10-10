@@ -12,8 +12,11 @@ problem graph -> H0 -> ACO sampling S0 -> solution hypergraph -> H1
 `graph_rounds` is fixed at one heatmap refinement, while training and
 validation each sample two ACO populations: `ACO(H0) -> H1 -> ACO(H1)`.
 The H1 population is included in the terminal archive used for training.
-Testing can report the first and/or second population, but no mode generates
-H2.
+Testing is S0-only: it generates H0 once per instance, then runs 10 ACO
+iterations on that fixed heatmap by default. Pheromone and the cumulative best
+tour carry across these iterations, but testing never constructs H1. It reports
+the average cumulative best path length after each ACO iteration. No mode
+generates H2.
 
 For a repeated training-pool instance, the current model always recomputes H0
 and ACO(H0) still samples S0. The archive from prior visits is reused, including
@@ -123,9 +126,9 @@ many times as the number of training epochs. Every visit starts by generating
 H0 from the latest model, then inherits only that instance's archive and
 previous H1 as described above. No search state is shared between different
 instances.
-The standard profile uses 400 fixed coordinates, batch size 20, 20 steps per
+The standard profile uses 800 fixed coordinates, batch size 20, 40 steps per
 epoch, 20 epochs, and one graph refinement plus a terminal ACO population.
-Each of the 400
+Each of the 800
 instances therefore participates exactly 20 times.
 Pool coordinates and cross-visit compressed archive paths are kept on CPU;
 only the current optimizer batch is materialized on the training device.
@@ -142,23 +145,26 @@ $ python3 train.py 100 --train_pool_mode refresh
 $ python3 train.py 100 --train_pool_mode mixed --pool_refresh_fraction 0.5
 ```
 
-All policies still visit exactly 400 instances per epoch. `fixed` repeats the
+All policies still visit exactly 800 instances per epoch. `fixed` repeats the
 same coordinates, `refresh` replaces all coordinates after each epoch, and
 `mixed` replaces the requested fraction while retaining the rest. Replaced
 instances lose their history; surviving instances keep it.
 
-Testing executes the same sampling, archive, hypergraph aggregation, and
-heatmap-update loop under `torch.no_grad()`.  It does not compute KL, call
-backward, or update model parameters. ACO, the archive, and visit-local
-heatmaps remain on CPU. H0 and the learned solution-graph residual run on the
-model device. No NLS or 2-opt improvement is applied by default; either can
-be enabled explicitly for matched comparisons.
+Testing runs only the first part of the training visit under
+`torch.no_grad()`: problem graph, trained initial GNN, H0, and repeated ACO
+sampling within S0. It does not create a solution archive, build a hypergraph,
+generate H1, calculate KL, or update model parameters. ACO stays on CPU and
+H0 is generated on the model device. Within each instance, the same ACO sampler
+retains its pheromone and best tour for all iterations; each new instance starts
+with a fresh sampler. No NLS or 2-opt improvement is applied
+by default; either can be enabled explicitly.
 Tour construction uses the seed-controlled PyTorch sampler by default. The
 optional `--sampling_backend numba` selects the original inference constructor; it can
 be faster at larger scales, but its thread-local random stream is not strictly
 reproducible and its thread-pool overhead made TSP50 slower in measurement.
-Action log-probabilities are skipped because none of the KL objectives consumes
-them.
+Action log-probabilities are skipped because the S0-only test does not need
+them. Training still uses its two KL objectives internally, but no longer
+prints or records their per-epoch values.
 
 ### Training
 
@@ -172,7 +178,7 @@ $ python3 train.py 100 --profile tsp100_finetune
 This explicit profile starts from `../pretrained/tsp_nls/tsp100-best.pt` and
 uses `k_sparse=10`, `lr=1e-4`, 3 epochs, 48 ants,
 1 graph refinement (2 ACO populations), 2 validation sampling rounds, and a
-fixed pool of 400 instances. It writes checkpoints to
+fixed pool of 800 instances. It writes checkpoints to
 `../pretrained/tsp_nls/optimized_v3_k10_finetune`. Individual command-line
 flags still override profile values. The profile is deliberately restricted
 to TSP100, but the revised pipeline still requires multi-seed validation.
@@ -194,7 +200,7 @@ $ python3 train.py 1000 --graph_rounds 1 --kl_weight 1.0
 
 `--graph_rounds` must be 1; training samples H0 and H1 once each.
 `--train_pool_size` controls the fixed pool size,
-defaults to 400, and must equal `--steps * --batch_size` so every pool member
+defaults to 800, and must equal `--steps * --batch_size` so every pool member
 is visited exactly once per epoch.
 `--profile standard` retains the general training defaults. `--elite_ratio`
 controls graph-update admission.
@@ -219,65 +225,55 @@ the full run completes. Old DeepACO checkpoints can be supplied with `--pretrain
 Missing solution-graph parameters are initialized with a zero output layer, so
 old DeepACO checkpoints start from deterministic heatmap refinement.
 
-Refinement ablations use the same ACO budget and checkpoint interface:
+The test entry point deliberately does not expose H1 refinement ablations:
+every test instance stops after S0, which contains multiple ACO iterations.
+Local search remains disabled by default
+and can be enabled explicitly:
 
 ```raw
-$ python3 test.py 100 --refinement_mode h0
-$ python3 test.py 100 --refinement_mode deterministic
-$ python3 test.py 100 --refinement_mode learned
-$ python3 test.py 100 --refinement_mode full
-```
-
-`h0` keeps the original heatmap fixed, `deterministic` uses only fixed archive
-aggregation, `learned` applies only the learned residual over the current
-heatmap, and `full` combines deterministic aggregation with that residual.
-The `h0` mode is evaluation-only; the other modes can be trained separately.
-
-Local search is an explicit matched-baseline option and remains disabled by
-default:
-
-```raw
-$ python3 test.py 100 --refinement_mode h0 --local_search none
-$ python3 test.py 100 --refinement_mode full --local_search none
-$ python3 test.py 100 --refinement_mode h0 --local_search nls
-$ python3 test.py 100 --refinement_mode full --local_search nls
+$ python3 test.py 100 --local_search none
+$ python3 test.py 100 --local_search nls
 ```
 
 The same `--local_search none|2opt|nls` option is available in `train.py`, so
-baseline and PHG-ACO checkpoints can be trained with matched search settings.
+checkpoints can be evaluated with matched search settings.
 
 ### Testing
 
 When `--model` is omitted, testing loads the root checkpoint
-`../pretrained/tsp_nls/tsp{nodes}-best.pt`. Legacy checkpoints do not contain
-the learned solution-graph updater, so the loader initializes its output at
-zero and reproduces deterministic refinement. Use a checkpoint trained on
-this branch to evaluate the full PHG-ACO model. Pass `--model` to select it
-explicitly. Testing defaults to `--seed 1234`, allowing two checkpoints to be
-compared with the same sampling randomness.
+`../pretrained/tsp_nls/tsp{nodes}-best.pt`. Pass `--model` to select a
+different checkpoint explicitly; only its initial-heatmap GNN is used by the
+S0-only test. Testing defaults to `--seed 1234`, allowing two checkpoints to
+be compared with the same sampling randomness. By default, each instance runs
+10 ACO iterations on its fixed H0. Output retains the original aggregate
+format: total duration followed by `T=1` through `T=10` average cumulative
+best path lengths, with no separate result line for each instance. Here `T`
+counts ACO iterations within S0, not H0/H1 heatmap refinements. Use
+`--iterations N` to change this count.
 
 When training uses a non-default candidate size, pass the same value at test
 time, for example:
 
 ```raw
-$ python3 test.py 100 --k_sparse 10 --iterations 1 2
+$ python3 test.py 100 --k_sparse 10
 ```
 
-Results produced by the earlier parameter-free updater are not reported as
-PHG-ACO results. Retrain the learned updater and report paired seeds before
-comparing it with DeepACO or the fixed-aggregation branch.
+This is an H0/S0 evaluation, not an evaluation of H1 or the learned
+solution-graph updater. Training still uses H1 and validates its terminal
+S1 cost when selecting the best checkpoint; keep that distinction in mind
+when interpreting S0-only test results.
 
 TSP200:
 ```
-$ python3 test.py 200 --iterations 1 2
+$ python3 test.py 200
 ```
 
 TSP500:
 ```
-$ python3 test.py 500 --iterations 1 2
+$ python3 test.py 500
 ```
 
 TSP1000:
 ```
-$ python3 test.py 1000 --iterations 1 2
+$ python3 test.py 1000
 ```

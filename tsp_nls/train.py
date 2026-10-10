@@ -1,5 +1,4 @@
 import argparse
-import csv
 from contextlib import contextmanager
 import os
 import random
@@ -35,20 +34,6 @@ def sampling_rounds_for_refinements(graph_rounds):
     if graph_rounds != DEFAULT_GRAPH_ROUNDS:
         raise ValueError("training supports exactly one H0 -> H1 refinement")
     return VALIDATION_SAMPLING_ROUNDS
-
-
-def population_cost_heatmap(initial_heatmap, graph_predictions, sampling_round):
-    """Detach H0 so only graph distillation trains the initial network."""
-    if sampling_round == 0:
-        return initial_heatmap.detach()
-    return graph_predictions[-1]
-
-
-def refined_population_cost_loss(population_losses):
-    """Average trainable population losses while excluding diagnostic H0."""
-    if len(population_losses) < 2:
-        raise ValueError("H0 plus at least one refined heatmap are required")
-    return torch.stack(population_losses[1:]).mean()
 
 
 def pool_refresh_fraction_for_mode(mode, mixed_fraction=0.5):
@@ -88,7 +73,7 @@ def resolve_training_profile(
             "lr": 1e-4,
             "epochs": 3,
             "k_sparse": 10,
-            "train_pool_size": 400,
+            "train_pool_size": 800,
             "pretrained": os.path.join(PRETRAINED_DIR, "tsp100-best.pt"),
             "output": os.path.join(
                 PRETRAINED_DIR, "optimized_v3_k10_finetune"
@@ -99,7 +84,7 @@ def resolve_training_profile(
             "lr": 3e-4,
             "epochs": 20,
             "k_sparse": None,
-            "train_pool_size": 400,
+            "train_pool_size": 800,
             "pretrained": None,
             "output": PRETRAINED_DIR,
         }
@@ -172,10 +157,6 @@ def train_instance(
     model.train()
     sum_loss = 0.0
     count = 0
-    h0_metric_sums = [0.0] * graph_rounds
-    cost_metric_sums = [0.0] * sampling_rounds_for_refinements(graph_rounds)
-    refinement_metric_sum = 0.0
-    path_cost_metric_sum = 0.0
 
     for training_instance in data:
         pyg_data, distances = training_instance.materialize(k_sparse, device)
@@ -196,9 +177,6 @@ def train_instance(
             local_search=local_search,
         )
 
-        h0_round_losses = []
-        graph_predictions = []
-        path_cost_losses = []
         # ``graph_rounds`` counts heatmap refinements.  Sampling once more
         # ensures the terminal H_graph_rounds is evaluated by a real ACO
         # population instead of existing only as an unsampled KL prediction.
@@ -217,30 +195,15 @@ def train_instance(
                 solutions.feasible_paths,
                 solutions.feasible_costs,
             )
-            # S0 constructs the solution hypergraph and H1. Its cost KL stays
-            # visible as a metric, but must not become a second H0 objective:
-            # the initial GNN is trained only by KL(stopgrad(H1) || H0).
-            sampling_prediction = population_cost_heatmap(
-                initial_heatmap,
-                graph_predictions,
-                sampling_round,
-            )
-            path_cost_losses.append(
-                population_quality_kl(
-                    sampling_prediction,
+            if sampling_round == graph_rounds:
+                path_cost_loss = population_quality_kl(
+                    refined_heatmap,
                     solutions.feasible_paths,
                     solutions.feasible_costs,
                     temperature=quality_temperature,
                     elite_ratio=elite_ratio,
                     uniform_mix=uniform_mix,
-                    support_mask=(
-                        initial_heatmap.detach() > (10.0 * EPS)
-                        if sampling_round == 0
-                        else None
-                    ),
                 )
-            )
-            if sampling_round == graph_rounds:
                 break
 
             refined_heatmap, _, _, _ = model.refine_heatmap(
@@ -264,27 +227,15 @@ def train_instance(
             kl_loss = refinement_distillation_kl(
                 initial_heatmap, refined_heatmap
             )
-            h0_round_losses.append(kl_loss)
             # Inputs to the graph updater are detached search state. Retaining
             # H1 lets S1's actual costs supervise the updater without sending
             # gradients into H0 or the discrete search.
-            graph_predictions.append(refined_heatmap)
             # The search state outlives this optimizer step.  Keeping it on
             # CPU and detached prevents stale autograd graphs and persistent
             # GPU growth while preserving the instance's heatmap trajectory.
             state.advance(refined_heatmap.detach().cpu())
 
-        refinement_loss = kl_weight * h0_round_losses[0]
-        # Round 0 is diagnostic-only.  The optimized cost objective starts at
-        # H1, so the scalar loss itself also matches the declared H0 objective.
-        path_cost_loss = refined_population_cost_loss(path_cost_losses)
-        sum_loss += refinement_loss + path_cost_kl_weight * path_cost_loss
-        for round_index, loss in enumerate(h0_round_losses):
-            h0_metric_sums[round_index] += float(loss.detach())
-        for round_index, loss in enumerate(path_cost_losses):
-            cost_metric_sums[round_index] += float(loss.detach())
-        refinement_metric_sum += float(refinement_loss.detach())
-        path_cost_metric_sum += float(path_cost_loss.detach())
+        sum_loss += kl_weight * kl_loss + path_cost_kl_weight * path_cost_loss
         count += 1
         training_instance.finish_visit()
 
@@ -295,14 +246,6 @@ def train_instance(
         parameters=model.parameters(), max_norm=3.0, norm_type=2
     )
     optimizer.step()
-    return {
-        "instances": count,
-        "h0": [value / count for value in h0_metric_sums],
-        "cost": [value / count for value in cost_metric_sums],
-        "refinement_weighted": refinement_metric_sum / count,
-        "path_cost_mean": path_cost_metric_sum / count,
-        "total_weighted": float(sum_loss.detach()),
-    }
 
 
 @torch.no_grad()
@@ -413,18 +356,12 @@ def train_epoch(
     refinement_mode="full",
     local_search=None,
 ):
-    h0_metric_sums = [0.0] * graph_rounds
-    cost_metric_sums = [0.0] * sampling_rounds_for_refinements(graph_rounds)
-    refinement_metric_sum = 0.0
-    path_cost_metric_sum = 0.0
-    total_metric_sum = 0.0
-    instance_count = 0
     for training_batch in iter_pool_batches(
         training_pool,
         steps=steps_per_epoch,
         batch_size=batch_size,
     ):
-        batch_metrics = train_instance(
+        train_instance(
             net,
             optimizer,
             training_batch,
@@ -447,70 +384,6 @@ def train_epoch(
             refinement_mode=refinement_mode,
             local_search=local_search,
         )
-        batch_count = batch_metrics["instances"]
-        instance_count += batch_count
-        for round_index, value in enumerate(batch_metrics["h0"]):
-            h0_metric_sums[round_index] += value * batch_count
-        for round_index, value in enumerate(batch_metrics["cost"]):
-            cost_metric_sums[round_index] += value * batch_count
-        refinement_metric_sum += (
-            batch_metrics["refinement_weighted"] * batch_count
-        )
-        path_cost_metric_sum += batch_metrics["path_cost_mean"] * batch_count
-        total_metric_sum += batch_metrics["total_weighted"] * batch_count
-
-    return {
-        "h0": [value / instance_count for value in h0_metric_sums],
-        "cost": [value / instance_count for value in cost_metric_sums],
-        "refinement_weighted": refinement_metric_sum / instance_count,
-        "path_cost_mean": path_cost_metric_sum / instance_count,
-        "total_weighted": total_metric_sum / instance_count,
-    }
-
-
-def write_kl_metrics_csv(file_path, history):
-    """Atomically persist per-epoch, per-round KL metrics."""
-    temporary_path = f"{file_path}.{os.getpid()}.tmp"
-    with open(temporary_path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=("epoch", "loss_type", "round", "value"),
-        )
-        writer.writeheader()
-        for epoch_metrics in history:
-            epoch = epoch_metrics["epoch"]
-            for round_index, value in enumerate(epoch_metrics["h0"], start=1):
-                writer.writerow(
-                    {
-                        "epoch": epoch,
-                        "loss_type": "L_H0",
-                        "round": round_index,
-                        "value": f"{value:.10f}",
-                    }
-                )
-            for round_index, value in enumerate(epoch_metrics["cost"]):
-                writer.writerow(
-                    {
-                        "epoch": epoch,
-                        "loss_type": "L_cost",
-                        "round": round_index,
-                        "value": f"{value:.10f}",
-                    }
-                )
-            for loss_type in (
-                "refinement_weighted",
-                "path_cost_mean",
-                "total_weighted",
-            ):
-                writer.writerow(
-                    {
-                        "epoch": epoch,
-                        "loss_type": loss_type,
-                        "round": "all",
-                        "value": f"{epoch_metrics[loss_type]:.10f}",
-                    }
-                )
-    os.replace(temporary_path, file_path)
 
 
 @torch.no_grad()
@@ -581,7 +454,7 @@ def train(
     quality_prior_strength=0.5,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
-    train_pool_size=400,
+    train_pool_size=800,
     max_solution_graph_solutions=None,
     max_archive_solutions=None,
     max_archive_rounds=None,
@@ -688,8 +561,6 @@ def train(
     print("epoch 0:", stats)
 
     sum_time = 0
-    kl_history = []
-    kl_metrics_path = os.path.join(savepath, "kl_metrics.csv")
     for epoch in range(1, epochs + 1):
         if epoch > 1:
             refreshed = refresh_training_pool(
@@ -699,7 +570,7 @@ def train(
             if refreshed:
                 print(f"refreshed training-pool coordinates: {refreshed}")
         start = time.time()
-        epoch_kl_metrics = train_epoch(
+        train_epoch(
             n_ants,
             k_sparse,
             steps_per_epoch,
@@ -723,21 +594,6 @@ def train(
             history_heatmap_weight=history_heatmap_weight,
             refinement_mode=refinement_mode,
             local_search=local_search,
-        )
-        epoch_kl_metrics["epoch"] = epoch
-        kl_history.append(epoch_kl_metrics)
-        write_kl_metrics_csv(kl_metrics_path, kl_history)
-        print(
-            f"epoch {epoch} KL:",
-            {
-                "L_H0": epoch_kl_metrics["h0"],
-                "L_cost": epoch_kl_metrics["cost"],
-                "refinement_weighted": epoch_kl_metrics[
-                    "refinement_weighted"
-                ],
-                "path_cost_mean": epoch_kl_metrics["path_cost_mean"],
-                "total_weighted": epoch_kl_metrics["total_weighted"],
-            },
         )
         sum_time += time.time() - start
         stats = validation(
@@ -777,7 +633,6 @@ def train(
     os.replace(temporary_best_path, best_path)
     print("\ntotal training duration:", sum_time)
     print("best validation epoch:", best_epoch)
-    print("KL metrics:", kl_metrics_path)
     return best_path
 
 
@@ -789,8 +644,8 @@ if __name__ == "__main__":
         choices=("standard", TSP100_FINETUNE_PROFILE),
         default="standard",
         help=(
-            "Training defaults. tsp100_finetune reproduces the validated "
-            "k=10 low-learning-rate experiment; explicit flags override it"
+            "Training defaults. tsp100_finetune uses k=10 and a low learning "
+            "rate with the 800-instance pool; explicit flags override it"
         ),
     )
     parser.add_argument(
@@ -813,8 +668,8 @@ if __name__ == "__main__":
                         help="Number of ants (matches test.py default)")
     parser.add_argument("-b", "--batch_size", type=int, default=20,
                         help="Batch size")
-    parser.add_argument("-s", "--steps", type=int, default=20,
-                        help="Steps per epoch")
+    parser.add_argument("-s", "--steps", type=int, default=40,
+                        help="Steps per epoch (default: 40 with batch size 20)")
     parser.add_argument(
         "-e",
         "--epochs",
@@ -833,7 +688,7 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help=(
-            "Fixed pool size; must equal steps * batch_size (default: 400)"
+            "Fixed pool size; must equal steps * batch_size (default: 800)"
         ),
     )
     parser.add_argument(
@@ -1052,8 +907,8 @@ if __name__ == "__main__":
         )
     if opt.refinement_mode == "h0":
         parser.error(
-            "--refinement_mode h0 is evaluation-only because KL-only training "
-            "has no non-trivial refinement target"
+            "--refinement_mode h0 cannot be trained because it has no "
+            "refined H1 target"
         )
 
     if opt.pretrained is not None and not os.path.isfile(opt.pretrained):
@@ -1082,7 +937,6 @@ if __name__ == "__main__":
                 else pool_refresh_fraction_for_mode(opt.train_pool_mode)
             ),
             "history_heatmap_weight": opt.history_heatmap_weight,
-            "path_cost_kl_weight": opt.path_cost_kl_weight,
             "max_solution_graph_solutions": opt.max_solution_graph_solutions,
             "max_archive_solutions": opt.max_archive_solutions,
             "max_archive_rounds": opt.max_archive_rounds,

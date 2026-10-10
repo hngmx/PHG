@@ -1,4 +1,7 @@
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
+from unittest.mock import patch
 
 import torch
 
@@ -7,9 +10,7 @@ from train import (
     DEFAULT_GRAPH_ROUNDS,
     VALIDATION_SAMPLING_ROUNDS,
     infer_instance as infer_validation_instance,
-    population_cost_heatmap,
     pool_refresh_fraction_for_mode,
-    refined_population_cost_loss,
     resolve_training_profile,
     sampling_rounds_for_refinements,
 )
@@ -27,38 +28,58 @@ class TrainingProfileTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             sampling_rounds_for_refinements(2)
 
-    def test_validation_and_test_reject_h2_rounds(self):
+    def test_validation_rejects_h2_rounds(self):
         with self.assertRaises(ValueError):
             infer_validation_instance(None, None, None, 48, graph_rounds=3)
-        with self.assertRaises(ValueError):
-            test_entrypoint.infer_instance(None, None, None, 48, [1, 2, 3])
 
-    def test_initial_cost_metric_does_not_train_h0(self):
-        h0 = torch.rand(4, 4, requires_grad=True)
+    def test_test_entrypoint_samples_only_s0(self):
+        calls = []
 
-        selected = population_cost_heatmap(h0, [], sampling_round=0)
+        class FakeModel:
+            def eval(self):
+                calls.append("eval")
 
-        self.assertFalse(selected.requires_grad)
-        self.assertEqual(selected.data_ptr(), h0.data_ptr())
+            def __call__(self, data):
+                return None
 
-    def test_refined_cost_loss_can_train_graph_updater(self):
-        h0 = torch.rand(4, 4, requires_grad=True)
-        h1 = torch.rand(4, 4, requires_grad=True)
+            def reshape(self, data, values):
+                return torch.ones(4, 4)
 
-        selected = population_cost_heatmap(h0, [h1], sampling_round=1)
+            def refine_heatmap(self, *args, **kwargs):
+                raise AssertionError("S0-only test must not construct H1")
 
-        self.assertIs(selected, h1)
-        self.assertTrue(selected.requires_grad)
+        class FakeSampler:
+            def __init__(self, **kwargs):
+                calls.append("create")
+                self.best_cost = 10.0
 
-    def test_cost_objective_excludes_h0_diagnostic(self):
-        h0_metric = torch.tensor(100.0)
-        h1_loss = torch.tensor(2.0, requires_grad=True)
+            def sample(self, **kwargs):
+                calls.append("sample")
+                self.best_cost -= 1.0
 
-        loss = refined_population_cost_loss([h0_metric, h1_loss])
-        loss.backward()
+        costs = test_entrypoint.infer_instance(
+            FakeModel(), None, torch.ones(4, 4), 4,
+            n_iterations=3,
+            sampler_factory=FakeSampler,
+        )
 
-        self.assertEqual(float(loss.detach()), 2.0)
-        self.assertEqual(float(h1_loss.grad), 1.0)
+        self.assertEqual(calls, ["eval", "create", "sample", "sample", "sample"])
+        self.assertEqual(costs, [9.0, 8.0, 7.0])
+
+    def test_test_aggregates_without_printing_each_instance(self):
+        output = StringIO()
+        with patch.object(
+            test_entrypoint,
+            "infer_instance",
+            side_effect=[[4.0, 3.0, 3.0], [6.0, 5.0, 4.0]],
+        ), redirect_stdout(output):
+            averages, _ = test_entrypoint.test(
+                [(None, None), (None, None)], None, 4,
+                n_iterations=3,
+            )
+
+        self.assertEqual(averages, [5.0, 4.0, 3.5])
+        self.assertEqual(output.getvalue(), "")
 
     def test_pool_modes_resolve_expected_refresh_fraction(self):
         self.assertEqual(pool_refresh_fraction_for_mode("fixed"), 0.0)
@@ -72,15 +93,15 @@ class TrainingProfileTest(unittest.TestCase):
 
         self.assertEqual(resolved["lr"], 3e-4)
         self.assertEqual(resolved["epochs"], 20)
-        self.assertEqual(resolved["train_pool_size"], 400)
+        self.assertEqual(resolved["train_pool_size"], 800)
 
-    def test_tsp100_finetune_profile_matches_legacy_preset(self):
+    def test_tsp100_finetune_profile_uses_800_instance_pool(self):
         resolved = resolve_training_profile(100, "tsp100_finetune")
 
         self.assertEqual(resolved["lr"], 1e-4)
         self.assertEqual(resolved["epochs"], 3)
         self.assertEqual(resolved["k_sparse"], 10)
-        self.assertEqual(resolved["train_pool_size"], 400)
+        self.assertEqual(resolved["train_pool_size"], 800)
         self.assertTrue(resolved["pretrained"].endswith("tsp100-best.pt"))
         self.assertTrue(
             resolved["output"].endswith("optimized_v3_k10_finetune")

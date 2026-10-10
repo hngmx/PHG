@@ -1,3 +1,5 @@
+"""Evaluate repeated ACO sampling on a fixed initial heatmap per instance."""
+
 import argparse
 import os
 import random
@@ -7,8 +9,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from net import Net, REFINEMENT_MODES
-from solution_graph import InstanceSearchState
+from net import Net
 from solution_sampler import ACOSolutionSampler
 from utils import load_test_dataset
 
@@ -16,16 +17,15 @@ from utils import load_test_dataset
 EPS = 1e-10
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 PRETRAINED_DIR = "../pretrained/tsp_nls"
-EVALUATION_ROUNDS = (1, 2)
 
 
 def default_checkpoint_candidates(nodes):
-    """Return the original root best-checkpoint path."""
+    """Return the root best-checkpoint path."""
     return [os.path.join(PRETRAINED_DIR, f"tsp{nodes}-best.pt")]
 
 
 def resolve_checkpoint_path(nodes, requested=None):
-    """Honor --model, otherwise use the original root best checkpoint."""
+    """Honor --model, otherwise use the root best checkpoint."""
     if requested is not None:
         return requested
     return default_checkpoint_candidates(nodes)[0]
@@ -37,85 +37,32 @@ def infer_instance(
     pyg_data,
     distances,
     n_ants,
-    evaluation_rounds,
-    quality_temperature=0.75,
-    age_decay=0.1,
-    uniform_mix=0.01,
-    elite_ratio=0.25,
-    quality_prior_strength=0.5,
-    propagation_strength=0.1,
-    distance_prior_strength=0.1,
-    max_solution_graph_solutions=None,
-    max_archive_solutions=None,
-    max_archive_rounds=None,
-    refinement_mode="full",
+    n_iterations=10,
     local_search=None,
     sampling_backend="torch",
     sampler_factory=ACOSolutionSampler,
 ):
-    """Keep one instance's graph and heatmap through all search rounds."""
-    if not evaluation_rounds or any(
-        round_idx not in EVALUATION_ROUNDS for round_idx in evaluation_rounds
-    ):
-        raise ValueError("evaluation rounds must be 1 and/or 2 (H0 and H1)")
+    """Run ACO on one H0 and return the cumulative best cost at each iteration."""
+    if n_iterations < 1:
+        raise ValueError("n_iterations must be positive")
     model.eval()
-    # ACO remains CPU-resident. H0 and the learned solution-graph residual run
-    # on the model device; visit-local search state returns to CPU between
-    # rounds. Local search follows the explicit matched-baseline option.
-    initial_heatmap = (model.reshape(pyg_data, model(pyg_data)) + EPS).cpu()
-    distances_cpu = distances.cpu()
-    state = InstanceSearchState(
-        initial_heatmap,
-        archive_max_solutions=max_archive_solutions,
-        archive_max_rounds=max_archive_rounds,
-    )
+    heatmap = (model.reshape(pyg_data, model(pyg_data)) + EPS).cpu()
     sampler = sampler_factory(
         n_solutions=n_ants,
-        heatmap=state.current_heatmap,
-        distances=distances_cpu,
+        heatmap=heatmap,
+        distances=distances.cpu(),
         device="cpu",
         local_search=local_search,
     )
-
-    requested = set(evaluation_rounds)
-    results = {}
-    max_round = max(evaluation_rounds)
-    for round_idx in range(1, max_round + 1):
-        sampler.set_heatmap(state.current_heatmap)
-        solutions = sampler.sample(
+    best_costs = []
+    for _ in range(n_iterations):
+        sampler.sample(
             inference=sampling_backend == "numba",
             require_log_probs=False,
             local_search_inference=False if local_search is not None else None,
         )
-        state.add_feasible_solutions(
-            solutions.feasible_paths,
-            solutions.feasible_costs,
-        )
-
-        if round_idx in requested:
-            results[round_idx] = sampler.best_cost
-
-        if round_idx < max_round:
-            next_heatmap = model.refine_heatmap(
-                state.current_heatmap.to(model.device),
-                distances_cpu.to(model.device),
-                state.archive,
-                quality_temperature=quality_temperature,
-                age_decay=age_decay,
-                uniform_mix=uniform_mix,
-                elite_ratio=elite_ratio,
-                prior_strength=quality_prior_strength,
-                propagation_strength=propagation_strength,
-                distance_prior_strength=distance_prior_strength,
-                max_solutions=max_solution_graph_solutions,
-                refinement_mode=refinement_mode,
-            )
-            state.advance(next_heatmap.detach().cpu())
-
-    return torch.tensor(
-        [results[round_idx] for round_idx in evaluation_rounds],
-        dtype=torch.float32,
-    )
+        best_costs.append(float(sampler.best_cost))
+    return best_costs
 
 
 @torch.no_grad()
@@ -123,46 +70,29 @@ def test(
     dataset,
     model,
     n_ants,
-    evaluation_rounds,
-    quality_temperature=0.75,
-    age_decay=0.1,
-    uniform_mix=0.01,
-    elite_ratio=0.25,
-    quality_prior_strength=0.5,
-    propagation_strength=0.1,
-    distance_prior_strength=0.1,
-    max_solution_graph_solutions=None,
-    max_archive_solutions=None,
-    max_archive_rounds=None,
-    refinement_mode="full",
+    n_iterations=10,
     local_search=None,
     sampling_backend="torch",
 ):
-    sum_results = torch.zeros(size=(len(evaluation_rounds),))
+    """Return mean cumulative best costs across instances, one per ACO round."""
+    if not dataset:
+        raise ValueError("test dataset cannot be empty")
+    if n_iterations < 1:
+        raise ValueError("n_iterations must be positive")
+    total_costs = np.zeros(n_iterations, dtype=np.float64)
     start = time.time()
     for pyg_data, distances in tqdm(dataset):
-        sum_results += infer_instance(
+        best_costs = infer_instance(
             model,
             pyg_data,
             distances,
             n_ants,
-            evaluation_rounds,
-            quality_temperature=quality_temperature,
-            age_decay=age_decay,
-            uniform_mix=uniform_mix,
-            elite_ratio=elite_ratio,
-            quality_prior_strength=quality_prior_strength,
-            propagation_strength=propagation_strength,
-            distance_prior_strength=distance_prior_strength,
-            max_solution_graph_solutions=max_solution_graph_solutions,
-            max_archive_solutions=max_archive_solutions,
-            max_archive_rounds=max_archive_rounds,
-            refinement_mode=refinement_mode,
+            n_iterations=n_iterations,
             local_search=local_search,
             sampling_backend=sampling_backend,
         )
-    duration = time.time() - start
-    return sum_results / len(dataset), duration
+        total_costs += best_costs
+    return (total_costs / len(dataset)).tolist(), time.time() - start
 
 
 def main(
@@ -170,27 +100,13 @@ def main(
     model_file,
     k_sparse=None,
     n_ants=48,
-    evaluation_rounds=None,
-    quality_temperature=0.75,
-    age_decay=0.1,
-    uniform_mix=0.01,
-    elite_ratio=0.25,
-    quality_prior_strength=0.5,
-    propagation_strength=0.1,
-    distance_prior_strength=0.1,
-    max_solution_graph_solutions=None,
-    max_archive_solutions=None,
-    max_archive_rounds=None,
-    refinement_mode="full",
+    n_iterations=10,
     local_search=None,
     sampling_backend="torch",
     test_size=None,
 ):
-    k_sparse = k_sparse or n_node // 10
-    evaluation_rounds = evaluation_rounds or list(EVALUATION_ROUNDS)
-    test_list = load_test_dataset(
-        n_node, k_sparse, device, start_node=0
-    )
+    k_sparse = k_sparse if k_sparse is not None else max(1, n_node // 10)
+    test_list = load_test_dataset(n_node, k_sparse, device, start_node=0)
     if test_size is not None:
         test_list = test_list[:test_size]
     print("problem scale:", n_node)
@@ -203,213 +119,81 @@ def main(
     incompatible = net_tsp.load_state_dict(
         torch.load(model_file, map_location=device), strict=False
     )
+    essential_missing = [
+        key for key in incompatible.missing_keys
+        if not key.startswith("solution_graph_net.")
+    ]
+    if essential_missing:
+        raise RuntimeError(
+            "checkpoint is missing initial-heatmap parameters: "
+            + ", ".join(essential_missing)
+        )
     if incompatible.unexpected_keys:
-        print(
-            "ignored obsolete trainable graph-updater parameters; "
-            "the current updater uses the PHG-ACO residual architecture"
-        )
-    if incompatible.missing_keys:
-        print(
-            "initialized missing PHG-ACO graph-updater parameters; "
-            "use a checkpoint trained on this branch for learned residuals"
-        )
+        print("ignored unused checkpoint parameters:", incompatible.unexpected_keys)
 
-    avg_aco_best, duration = test(
+    average_costs, duration = test(
         test_list,
         net_tsp,
         n_ants,
-        evaluation_rounds,
-        quality_temperature=quality_temperature,
-        age_decay=age_decay,
-        uniform_mix=uniform_mix,
-        elite_ratio=elite_ratio,
-        quality_prior_strength=quality_prior_strength,
-        propagation_strength=propagation_strength,
-        distance_prior_strength=distance_prior_strength,
-        max_solution_graph_solutions=max_solution_graph_solutions,
-        max_archive_solutions=max_archive_solutions,
-        max_archive_rounds=max_archive_rounds,
-        refinement_mode=refinement_mode,
+        n_iterations=n_iterations,
         local_search=local_search,
         sampling_backend=sampling_backend,
     )
     print("total duration:", duration)
-    for round_idx, average_cost in zip(evaluation_rounds, avg_aco_best):
-        print(f"T={round_idx}, average cost is {average_cost}.")
+    for iteration, average_cost in enumerate(average_costs, start=1):
+        print(f"T={iteration}, average cost is {average_cost}.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("nodes", type=int, help="Problem scale")
     parser.add_argument(
-        "-m",
-        "--model",
-        type=str,
-        default=None,
-        help=(
-            "Path to checkpoint file; defaults to the original root "
-            "../pretrained/tsp_nls/tsp{nodes}-best.pt"
-        ),
+        "-m", "--model", type=str, default=None,
+        help="Checkpoint path; defaults to ../pretrained/tsp_nls/tsp{nodes}-best.pt",
     )
     parser.add_argument("-a", "--ants", type=int, default=48,
-                        help="Number of ants")
+                        help="Number of ants sampled at each ACO iteration")
     parser.add_argument(
-        "--k_sparse",
-        type=int,
-        default=None,
+        "-i", "--iterations", type=int, default=10,
+        help="ACO iterations per instance on fixed H0 (default: 10)",
+    )
+    parser.add_argument(
+        "--k_sparse", type=int, default=None,
         help="Candidate neighbors per node; must match training",
     )
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=1234,
-        help="Random seed used for reproducible checkpoint comparison",
+        "--seed", type=int, default=1234,
+        help="Random seed for reproducible ACO sampling",
     )
     parser.add_argument(
-        "-i",
-        "--iterations",
-        type=int,
-        nargs="+",
-        default=list(EVALUATION_ROUNDS),
-        help="Report ACO results after H0 and/or H1 (rounds 1 and 2 only)",
+        "--sampling_backend", choices=("numba", "torch"), default="torch",
+        help="Tour-construction backend",
     )
     parser.add_argument(
-        "--quality_temperature",
-        type=float,
-        default=0.75,
-        help="Softmax temperature used to weight archived solution quality",
+        "--local_search", choices=("none", "2opt", "nls"), default="none",
+        help="Optional local search; default is pure ACO",
     )
     parser.add_argument(
-        "--age_decay",
-        type=float,
-        default=0.1,
-        help="Exponential log-weight decay per archived round",
-    )
-    parser.add_argument(
-        "--uniform_mix",
-        type=float,
-        default=0.01,
-        help="Uniform mixture preserving influence from diverse solutions",
-    )
-    parser.add_argument(
-        "--elite_ratio",
-        type=float,
-        default=0.25,
-        help="Best-cost fraction of each population used to update H1",
-    )
-    parser.add_argument(
-        "--quality_prior_strength",
-        type=float,
-        default=0.5,
-        help=(
-            "Previous-heatmap share in the deterministic update; default "
-            "0.5 gives a 1:1 mix with the new graph target"
-        ),
-    )
-    parser.add_argument(
-        "--propagation_strength",
-        type=float,
-        default=0.1,
-        help="Edge-solution-edge aggregation strength used to construct H1",
-    )
-    parser.add_argument(
-        "--distance_prior_strength",
-        type=float,
-        default=0.1,
-        help="Normalized inverse-distance mixture used to construct H1",
-    )
-    parser.add_argument(
-        "--sampling_backend",
-        choices=("numba", "torch"),
-        default="torch",
-        help=(
-            "Tour-construction backend. 'torch' is reproducible and faster "
-            "for TSP50 on the tested machine; 'numba' can help at larger scales"
-        ),
-    )
-    parser.add_argument(
-        "--max_solution_graph_solutions",
-        type=int,
-        default=None,
-        help="Optional learned-graph tour cap; default keeps all archived tours",
-    )
-    parser.add_argument(
-        "--max_archive_solutions",
-        type=int,
-        default=None,
-        help="Optional cap on unique tours retained by one test instance",
-    )
-    parser.add_argument(
-        "--max_archive_rounds",
-        type=int,
-        default=None,
-        help="Optional cap on ACO populations retained by one test instance",
-    )
-    parser.add_argument(
-        "--refinement_mode",
-        choices=REFINEMENT_MODES,
-        default="full",
-        help="Ablate H0-only, deterministic, learned-only, or full refinement",
-    )
-    parser.add_argument(
-        "--local_search",
-        choices=("none", "2opt", "nls"),
-        default="none",
-        help="Optional local-search baseline; default is pure ACO",
-    )
-    parser.add_argument(
-        "--test_size",
-        type=int,
-        default=None,
+        "--test_size", type=int, default=None,
         help="Evaluate only the first N instances (default: full test set)",
     )
     opt = parser.parse_args()
 
-    if not opt.iterations or min(opt.iterations) < 1:
-        parser.error("all --iterations values must be positive")
-    if sorted(set(opt.iterations)) != opt.iterations:
-        parser.error("--iterations must be unique and sorted")
-    if any(round_idx not in EVALUATION_ROUNDS for round_idx in opt.iterations):
-        parser.error("--iterations may contain only 1 and/or 2 (H0 and H1)")
-    if opt.quality_temperature <= 0:
-        parser.error("--quality_temperature must be positive")
-    if opt.age_decay < 0:
-        parser.error("--age_decay must be non-negative")
+    if opt.nodes < 2:
+        parser.error("nodes must be at least 2")
+    if opt.ants < 1:
+        parser.error("--ants must be positive")
+    if opt.iterations < 1:
+        parser.error("--iterations must be positive")
     if opt.k_sparse is not None and not 1 <= opt.k_sparse < opt.nodes:
         parser.error("--k_sparse must be in [1, nodes - 1]")
-    if not 0 <= opt.uniform_mix <= 1:
-        parser.error("--uniform_mix must be between 0 and 1")
-    if not 0 < opt.elite_ratio <= 1:
-        parser.error("--elite_ratio must be in (0, 1]")
-    if not 0 <= opt.quality_prior_strength <= 1:
-        parser.error("--quality_prior_strength must be between 0 and 1")
-    if not 0 <= opt.propagation_strength <= 1:
-        parser.error("--propagation_strength must be between 0 and 1")
-    if not 0 <= opt.distance_prior_strength <= 1:
-        parser.error("--distance_prior_strength must be between 0 and 1")
     if opt.test_size is not None and opt.test_size < 1:
         parser.error("--test_size must be positive")
-    if opt.max_solution_graph_solutions is not None and opt.max_solution_graph_solutions < 1:
-        parser.error("--max_solution_graph_solutions must be positive")
-    if opt.max_archive_solutions is not None and opt.max_archive_solutions < 1:
-        parser.error("--max_archive_solutions must be positive")
-    if opt.max_archive_rounds is not None and opt.max_archive_rounds < 1:
-        parser.error("--max_archive_rounds must be positive")
-    if (
-        opt.max_solution_graph_solutions is not None
-        and opt.max_archive_solutions is not None
-        and opt.max_solution_graph_solutions > opt.max_archive_solutions
-    ):
-        parser.error(
-            "--max_solution_graph_solutions cannot exceed "
-            "--max_archive_solutions"
-        )
     opt.local_search = None if opt.local_search == "none" else opt.local_search
 
     filepath = resolve_checkpoint_path(opt.nodes, opt.model)
     if not os.path.isfile(filepath):
-        searched = ", ".join(default_checkpoint_candidates(opt.nodes))
-        print(f"Checkpoint file '{filepath}' not found! Searched: {searched}")
+        print(f"Checkpoint file '{filepath}' not found!")
         raise SystemExit(1)
 
     random.seed(opt.seed)
@@ -423,18 +207,7 @@ if __name__ == "__main__":
         filepath,
         k_sparse=opt.k_sparse,
         n_ants=opt.ants,
-        evaluation_rounds=opt.iterations,
-        quality_temperature=opt.quality_temperature,
-        age_decay=opt.age_decay,
-        uniform_mix=opt.uniform_mix,
-        elite_ratio=opt.elite_ratio,
-        quality_prior_strength=opt.quality_prior_strength,
-        propagation_strength=opt.propagation_strength,
-        distance_prior_strength=opt.distance_prior_strength,
-        max_solution_graph_solutions=opt.max_solution_graph_solutions,
-        max_archive_solutions=opt.max_archive_solutions,
-        max_archive_rounds=opt.max_archive_rounds,
-        refinement_mode=opt.refinement_mode,
+        n_iterations=opt.iterations,
         local_search=opt.local_search,
         sampling_backend=opt.sampling_backend,
         test_size=opt.test_size,
