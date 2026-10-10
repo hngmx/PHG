@@ -7,6 +7,7 @@ from training_pool import (
     iter_pool_batches,
     refresh_training_pool,
 )
+from solution_graph import normalize_heatmap_rows
 
 
 class PersistentTrainingPoolTest(unittest.TestCase):
@@ -35,14 +36,19 @@ class PersistentTrainingPoolTest(unittest.TestCase):
 
         self.assertEqual([instance.visits for instance in pool], [4] * 6)
 
-    def test_instance_starts_each_visit_with_an_empty_archive(self):
+    def test_instance_reuses_archive_and_h1_but_samples_from_fresh_h0(self):
         instance = create_training_pool(count=1, n_nodes=5)[0]
         first_state = instance.start_visit(torch.ones(5, 5))
+        self.assertIs(first_state.refinement_prior_heatmap, first_state.current_heatmap)
         first_state.add_feasible_solutions(
             torch.tensor([[0], [1], [2], [3], [4]]),
             torch.tensor([5.0]),
         )
         first_state.advance(torch.full((5, 5), 2.0))
+        first_state.add_feasible_solutions(
+            torch.tensor([[0], [2], [1], [3], [4]]),
+            torch.tensor([4.0]),
+        )
         instance.finish_visit()
 
         latest_h0 = torch.ones(5, 5) - torch.eye(5)
@@ -51,15 +57,47 @@ class PersistentTrainingPoolTest(unittest.TestCase):
 
         self.assertIsNot(second_state, first_state)
         self.assertEqual(instance.visits, 1)
-        self.assertEqual(len(second_state.archive), 0)
-        self.assertEqual(second_state.archive.num_rounds, 0)
+        self.assertIs(second_state.archive, first_state.archive)
+        self.assertEqual(len(second_state.archive), 2)
+        self.assertEqual(second_state.archive.num_rounds, 2)
+        self.assertEqual(second_state.round_index, 0)
         self.assertTrue(torch.equal(second_state.current_heatmap, latest_h0))
+        expected_prior = 0.5 * (
+            normalize_heatmap_rows(latest_h0)
+            + normalize_heatmap_rows(first_state.current_heatmap)
+        )
+        self.assertTrue(
+            torch.allclose(second_state.refinement_prior_heatmap, expected_prior)
+        )
         self.assertGreater(
             float(second_state.current_heatmap[0, 1]),
             float(second_state.current_heatmap[0, 2]),
         )
         self.assertFalse(second_state.current_heatmap.requires_grad)
         self.assertEqual(second_state.current_heatmap.device.type, "cpu")
+        self.assertFalse(second_state.refinement_prior_heatmap.requires_grad)
+
+    def test_history_prior_weight_and_limits_are_checked(self):
+        instance = create_training_pool(count=1, n_nodes=5)[0]
+        with self.assertRaises(ValueError):
+            instance.start_visit(torch.ones(5, 5), history_heatmap_weight=1.1)
+        first = instance.start_visit(
+            torch.ones(5, 5), archive_max_solutions=8
+        )
+        first.advance(torch.eye(5) + 2)
+        instance.finish_visit()
+        fresh_h0 = torch.ones(5, 5) - torch.eye(5)
+        with self.assertRaises(ValueError):
+            instance.start_visit(fresh_h0, archive_max_solutions=4)
+        second = instance.start_visit(
+            fresh_h0,
+            archive_max_solutions=8,
+            history_heatmap_weight=0,
+        )
+        self.assertTrue(torch.allclose(
+            second.refinement_prior_heatmap,
+            normalize_heatmap_rows(fresh_h0),
+        ))
 
     def test_pool_rejects_size_different_from_epoch_demand(self):
         pool = create_training_pool(count=2, n_nodes=5)

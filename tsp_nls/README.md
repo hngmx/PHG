@@ -1,8 +1,8 @@
 ## PHG-ACO: persistent hypergraph-guided ACO for TSP
 
 This variant treats heatmap construction as an iterative, per-instance search
-process. An instance owns its current heatmap, feasible-solution archive, and
-solution hypergraph during one search visit:
+process. A training instance retains its feasible-solution archive and last H1
+across visits, while each visit still runs only one refinement:
 
 ```text
 problem graph -> H0 -> ACO sampling S0 -> solution hypergraph -> H1
@@ -15,14 +15,32 @@ The H1 population is included in the terminal archive used for training.
 Testing can report the first and/or second population, but no mode generates
 H2.
 
+For a repeated training-pool instance, the current model always recomputes H0
+and ACO(H0) still samples S0. The archive from prior visits is reused, including
+the previous terminal S1 population. Only H1 construction uses a history prior:
+
+```text
+prior = (1 - history_heatmap_weight) * normalize(H0_new)
+      + history_heatmap_weight * normalize(stopgrad(H1_previous))
+H1_new = refine(prior, inherited_archive + S0_new)
+S1_new = ACO(H1_new)
+save(inherited_archive + S0_new + S1_new, detach(H1_new))
+```
+
+The default history weight is `0.5`. The first visit has no historical H1, so
+its refinement prior is simply H0. Both the historical H1 and the new H0 are
+detached before forming the refinement prior; the H0 distillation loss still
+trains the current initial GNN. Historical heatmaps never replace the fresh H0
+used by S0, and no extra H2 is generated.
+
 The initial GNN heatmap is sparse and therefore compresses the candidate
 solution space. A sampler is accessed through the interface in
 `solution_sampler.py`; ACO sampling is used directly and local search is
 disabled by default but available as a matched baseline. A different constrained decoder can return the same
 `SolutionBatch` fields.
 
-Distinct feasible ACO tours are retained in the visit-local solution
-hypergraph. Cyclic rotations and reversed
+Distinct feasible ACO tours are retained across visits to the same training
+instance. Cyclic rotations and reversed
 orientations of the same undirected tour are stored once; observing a duplicate
 refreshes its recency instead of multiplying its weight:
 
@@ -64,7 +82,8 @@ support, and the preceding heatmap are row-normalized before convex mixing.
 deterministic update mixes the new graph target and the preceding heatmap at
 `1:1`.
 
-By default, the visit archive retains all unique tours and all sampling rounds,
+By default, each training instance's archive retains all unique tours and all
+sampling rounds across its visits,
 and the learned updater uses every archived tour. Optional positive limits can
 be set for archive tours, archive rounds, and learned-graph tours; pruning
 rebuilds the deduplication index and online statistics when needed. Unbounded
@@ -100,16 +119,20 @@ There is no REINFORCE or entropy loss.
 The standard training policy uses a fixed coordinate pool. Every epoch
 shuffles the pool and visits every instance exactly once, with no omission,
 duplication, or replacement. Therefore, an instance participates exactly as
-many times as the number of training epochs. Every visit starts from the latest model H0 and an
-empty solution archive, exactly like a fresh test instance. Heatmaps and tours
-accumulate only through the visit-local refinement sequence.
+many times as the number of training epochs. Every visit starts by generating
+H0 from the latest model, then inherits only that instance's archive and
+previous H1 as described above. No search state is shared between different
+instances.
 The standard profile uses 400 fixed coordinates, batch size 20, 20 steps per
 epoch, 20 epochs, and one graph refinement plus a terminal ACO population.
 Each of the 400
 instances therefore participates exactly 20 times.
-Pool coordinates and visit-local compressed archive paths are kept on CPU;
+Pool coordinates and cross-visit compressed archive paths are kept on CPU;
 only the current optimizer batch is materialized on the training device.
-States are never shared between visits or different TSP instances.
+The learned graph updater still uses every archived tour by default, so memory
+and per-visit computation can increase over epochs. Fresh validation and test
+instances do not have historical archives or H1 heatmaps; this difference
+should be considered when interpreting held-out results.
 
 Coordinate-pool overfitting can be measured with three matched policies:
 
@@ -121,7 +144,8 @@ $ python3 train.py 100 --train_pool_mode mixed --pool_refresh_fraction 0.5
 
 All policies still visit exactly 400 instances per epoch. `fixed` repeats the
 same coordinates, `refresh` replaces all coordinates after each epoch, and
-`mixed` replaces the requested fraction while retaining the rest.
+`mixed` replaces the requested fraction while retaining the rest. Replaced
+instances lose their history; surviving instances keep it.
 
 Testing executes the same sampling, archive, hypergraph aggregation, and
 heatmap-update loop under `torch.no_grad()`.  It does not compute KL, call
@@ -177,7 +201,13 @@ controls graph-update admission.
 `--path_cost_kl_weight` controls supervision from actual ACO costs, and
 `--max_solution_graph_solutions`, `--max_archive_solutions`, and
 `--max_archive_rounds` are optional positive caps. By default none of these
-three limits is applied; each search visit still starts with an empty archive.
+three limits is applied. The first visit starts with an empty archive, while
+later visits of the same training instance reuse it.
+`--history_heatmap_weight` controls the old H1 share in the normalized prior
+used only for H1 construction. Its default is `0.5`; `0` keeps the archive but
+uses only the new H0 as the refinement prior. This is distinct from
+`--quality_prior_strength`, which mixes the refinement prior with the
+hypergraph target in the deterministic update.
 `--validation_rounds` must be 2 ACO populations. `--quality_temperature`,
 `--age_decay`, and `--uniform_mix` control quality weighting.
 `--quality_prior_strength` smooths the quality target with the preceding

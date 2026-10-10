@@ -163,6 +163,7 @@ def train_instance(
     max_solution_graph_solutions=None,
     max_archive_solutions=None,
     max_archive_rounds=None,
+    history_heatmap_weight=0.5,
     refinement_mode="full",
     local_search=None,
     sampler_factory=ACOSolutionSampler,
@@ -184,6 +185,7 @@ def train_instance(
             initial_heatmap,
             archive_max_solutions=max_archive_solutions,
             archive_max_rounds=max_archive_rounds,
+            history_heatmap_weight=history_heatmap_weight,
         )
 
         sampler = sampler_factory(
@@ -242,7 +244,7 @@ def train_instance(
                 break
 
             refined_heatmap, _, _, _ = model.refine_heatmap(
-                state.current_heatmap.to(model.device),
+                state.refinement_prior_heatmap.to(model.device),
                 distances,
                 state.archive,
                 quality_temperature=quality_temperature,
@@ -407,6 +409,7 @@ def train_epoch(
     max_solution_graph_solutions=None,
     max_archive_solutions=None,
     max_archive_rounds=None,
+    history_heatmap_weight=0.5,
     refinement_mode="full",
     local_search=None,
 ):
@@ -440,6 +443,7 @@ def train_epoch(
             max_solution_graph_solutions=max_solution_graph_solutions,
             max_archive_solutions=max_archive_solutions,
             max_archive_rounds=max_archive_rounds,
+            history_heatmap_weight=history_heatmap_weight,
             refinement_mode=refinement_mode,
             local_search=local_search,
         )
@@ -581,6 +585,7 @@ def train(
     max_solution_graph_solutions=None,
     max_archive_solutions=None,
     max_archive_rounds=None,
+    history_heatmap_weight=0.5,
     refinement_mode="full",
     local_search=None,
     train_pool_mode="fixed",
@@ -595,6 +600,8 @@ def train(
         raise ValueError("h0 refinement mode is evaluation-only")
     if refinement_mode not in REFINEMENT_MODES:
         raise ValueError(f"unknown refinement mode: {refinement_mode}")
+    if not 0 <= history_heatmap_weight <= 1:
+        raise ValueError("history heatmap weight must be between 0 and 1")
     if (
         max_solution_graph_solutions is not None
         and max_archive_solutions is not None
@@ -638,7 +645,8 @@ def train(
         "training coordinate pool:",
         f"mode={train_pool_mode}, size={len(training_pool)}, "
         f"refresh_fraction={resolved_refresh_fraction}; every current pool "
-        "member is visited once per epoch",
+        "member is visited once per epoch; surviving members retain their "
+        "solution archive and H1",
     )
     val_list = load_val_dataset(n_node, k_sparse, device, start_node=0)
     if test_size is not None:
@@ -712,6 +720,7 @@ def train(
             max_solution_graph_solutions=max_solution_graph_solutions,
             max_archive_solutions=max_archive_solutions,
             max_archive_rounds=max_archive_rounds,
+            history_heatmap_weight=history_heatmap_weight,
             refinement_mode=refinement_mode,
             local_search=local_search,
         )
@@ -840,6 +849,15 @@ if __name__ == "__main__":
         help="Fraction replaced per epoch when --train_pool_mode mixed",
     )
     parser.add_argument(
+        "--history_heatmap_weight",
+        type=float,
+        default=0.5,
+        help=(
+            "Previous H1 share in the normalized refinement prior on a "
+            "revisit; S0 still samples from the fresh H0 (default: 0.5)"
+        ),
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=1234,
@@ -927,13 +945,13 @@ if __name__ == "__main__":
         "--max_archive_solutions",
         type=int,
         default=None,
-        help="Optional cap on unique tours retained by each visit archive",
+        help="Optional cap on unique tours retained by each instance archive",
     )
     parser.add_argument(
         "--max_archive_rounds",
         type=int,
         default=None,
-        help="Optional cap on ACO populations retained by each visit archive",
+        help="Optional cap on ACO populations retained by each instance archive",
     )
     parser.add_argument(
         "--refinement_mode",
@@ -995,6 +1013,8 @@ if __name__ == "__main__":
         )
     if not 0 <= opt.pool_refresh_fraction <= 1:
         parser.error("--pool_refresh_fraction must be between 0 and 1")
+    if not 0 <= opt.history_heatmap_weight <= 1:
+        parser.error("--history_heatmap_weight must be between 0 and 1")
     if opt.k_sparse is not None and not 1 <= opt.k_sparse < opt.nodes:
         parser.error("--k_sparse must be in [1, nodes - 1]")
     if opt.kl_weight < 0:
@@ -1061,6 +1081,7 @@ if __name__ == "__main__":
                 if opt.train_pool_mode == "mixed"
                 else pool_refresh_fraction_for_mode(opt.train_pool_mode)
             ),
+            "history_heatmap_weight": opt.history_heatmap_weight,
             "path_cost_kl_weight": opt.path_cost_kl_weight,
             "max_solution_graph_solutions": opt.max_solution_graph_solutions,
             "max_archive_solutions": opt.max_archive_solutions,
@@ -1101,5 +1122,6 @@ if __name__ == "__main__":
         local_search=opt.local_search,
         train_pool_mode=opt.train_pool_mode,
         pool_refresh_fraction=opt.pool_refresh_fraction,
+        history_heatmap_weight=opt.history_heatmap_weight,
         seed=opt.seed,
     )

@@ -9,9 +9,9 @@ equivalent hypergraph incidence representation instead:
     edge node <-> sampled solution (hyperedge)
 
 Two edge nodes are related exactly when they share at least one solution
-hyperedge. ``SolutionArchive`` retains unique solutions within one visit;
-rotation/reversal duplicates refresh recency in place. Optional caps can prune
-older rounds or lower-ranked tours.
+hyperedge. ``SolutionArchive`` retains unique solutions across visits to the
+same training instance; rotation/reversal duplicates refresh recency in place.
+Optional caps can prune older rounds or lower-ranked tours.
 """
 
 from __future__ import annotations
@@ -447,8 +447,9 @@ class SolutionArchive:
 class InstanceSearchState:
     """Heatmap and cumulative hypergraph state owned by one problem instance.
 
-    The state lives for all inner refinement rounds of a training or inference
-    episode.  It is intentionally not shared across unrelated TSP instances.
+    Training may carry the archive and previous H1 into a new visit of the same
+    instance.  Search still starts from that visit's fresh H0, while the carried
+    H1 only contributes to the heatmap prior used for its sole refinement.
     """
 
     def __init__(
@@ -458,6 +459,8 @@ class InstanceSearchState:
         archive_path_dtype=None,
         archive_max_solutions=None,
         archive_max_rounds=None,
+        archive=None,
+        refinement_prior_heatmap=None,
     ):
         if initial_heatmap.dim() != 2:
             raise ValueError("initial heatmap must be a matrix")
@@ -466,7 +469,18 @@ class InstanceSearchState:
 
         self.initial_heatmap = initial_heatmap
         self.current_heatmap = initial_heatmap
-        self.archive = SolutionArchive(
+        if refinement_prior_heatmap is not None and (
+            refinement_prior_heatmap.shape != initial_heatmap.shape
+        ):
+            raise ValueError("refinement prior shape must match the heatmap")
+        self.refinement_prior_heatmap = (
+            initial_heatmap
+            if refinement_prior_heatmap is None
+            else refinement_prior_heatmap
+        )
+        if archive is not None and archive.n_nodes != initial_heatmap.size(0):
+            raise ValueError("inherited archive node count must match the heatmap")
+        self.archive = archive if archive is not None else SolutionArchive(
             n_nodes=initial_heatmap.size(0),
             storage_device=archive_device,
             path_dtype=archive_path_dtype,

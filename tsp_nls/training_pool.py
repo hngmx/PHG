@@ -5,13 +5,13 @@ from typing import Optional
 
 import torch
 
-from solution_graph import InstanceSearchState
+from solution_graph import InstanceSearchState, normalize_heatmap_rows
 from utils import gen_pyg_data
 
 
 @dataclass
 class PersistentTrainingInstance:
-    """One fixed TSP instance with visit-local search state."""
+    """One fixed TSP instance with a cross-visit archive and H1 prior."""
 
     coordinates: torch.Tensor
     state: Optional[InstanceSearchState] = None
@@ -42,16 +42,40 @@ class PersistentTrainingInstance:
         initial_heatmap,
         archive_max_solutions=None,
         archive_max_rounds=None,
+        history_heatmap_weight=0.5,
     ):
-        """Start from H0 and an empty archive, matching fresh test instances."""
+        """Sample from fresh H0 while reusing this instance's archive and H1."""
         if initial_heatmap.shape != (self.n_nodes, self.n_nodes):
             raise ValueError("initial heatmap shape does not match the instance")
+        if not 0 <= history_heatmap_weight <= 1:
+            raise ValueError("history heatmap weight must be between 0 and 1")
+
+        fresh_h0 = initial_heatmap.detach().clone().cpu()
+        previous = self.state
+        archive = None
+        refinement_prior = fresh_h0
+        if previous is not None:
+            archive = previous.archive
+            if (
+                archive.max_solutions != archive_max_solutions
+                or archive.max_rounds != archive_max_rounds
+            ):
+                raise ValueError("archive limits cannot change between visits")
+            old_h1 = previous.current_heatmap.detach().cpu()
+            refinement_prior = (
+                (1.0 - history_heatmap_weight)
+                * normalize_heatmap_rows(fresh_h0)
+                + history_heatmap_weight
+                * normalize_heatmap_rows(old_h1)
+            )
         self.state = InstanceSearchState(
-            initial_heatmap.detach().cpu(),
+            fresh_h0,
             archive_device="cpu",
             archive_path_dtype=torch.int32,
             archive_max_solutions=archive_max_solutions,
             archive_max_rounds=archive_max_rounds,
+            archive=archive,
+            refinement_prior_heatmap=refinement_prior,
         )
         return self.state
 
