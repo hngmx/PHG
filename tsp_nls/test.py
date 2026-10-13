@@ -41,10 +41,13 @@ def infer_instance(
     local_search=None,
     sampling_backend="torch",
     sampler_factory=ACOSolutionSampler,
+    return_training_metrics=False,
 ):
-    """Run ACO on one H0 and return the cumulative best cost at each iteration."""
+    """Run ACO on one H0; optionally report DeepACO-style training metrics."""
     if n_iterations < 1:
         raise ValueError("n_iterations must be positive")
+    if return_training_metrics and n_iterations < 5:
+        raise ValueError("DeepACO training metrics require at least 5 ACO iterations")
     model.eval()
     heatmap = (model.reshape(pyg_data, model(pyg_data)) + EPS).cpu()
     sampler = sampler_factory(
@@ -55,13 +58,24 @@ def infer_instance(
         local_search=local_search,
     )
     best_costs = []
-    for _ in range(n_iterations):
+    training_metrics = []
+    if return_training_metrics:
+        # The original DeepACO validation first probes the sampler without
+        # changing pheromone or the cumulative best, then runs ACO for 1+4
+        # iterations. Keep the checkpoint curve at 10 actual ACO iterations.
+        probe_costs = sampler.probe(inference=sampling_backend == "numba")
+        training_metrics.extend((float(probe_costs.mean()), float(probe_costs.min())))
+    for iteration in range(n_iterations):
         sampler.sample(
             inference=sampling_backend == "numba",
             require_log_probs=False,
             local_search_inference=False if local_search is not None else None,
         )
         best_costs.append(float(sampler.best_cost))
+        if return_training_metrics and iteration in (0, 4):
+            training_metrics.append(float(sampler.best_cost))
+    if return_training_metrics:
+        return best_costs, training_metrics
     return best_costs
 
 
@@ -105,7 +119,7 @@ def main(
     sampling_backend="torch",
     test_size=None,
 ):
-    k_sparse = k_sparse if k_sparse is not None else max(1, n_node // 10)
+    k_sparse = k_sparse if k_sparse is not None else n_node - 1
     test_list = load_test_dataset(n_node, k_sparse, device, start_node=0)
     if test_size is not None:
         test_list = test_list[:test_size]
@@ -113,7 +127,6 @@ def main(
     print("checkpoint:", model_file)
     print("number of instances:", len(test_list))
     print("device:", "cpu" if device == "cpu" else device + "+cpu")
-    print("sampling backend:", sampling_backend)
 
     net_tsp = Net().to(device)
     incompatible = net_tsp.load_state_dict(
@@ -159,7 +172,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--k_sparse", type=int, default=None,
-        help="Candidate neighbors per node; must match training",
+        help="Candidate neighbors per node (default: full graph, nodes - 1); must match training",
     )
     parser.add_argument(
         "--seed", type=int, default=1234,

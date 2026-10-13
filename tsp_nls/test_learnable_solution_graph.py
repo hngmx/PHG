@@ -6,7 +6,7 @@ from net import Net
 from solution_graph import (
     SolutionArchive,
     normalize_heatmap_rows,
-    population_quality_kl,
+    refinement_distillation_kl,
 )
 
 
@@ -53,22 +53,21 @@ class LearnableSolutionGraphTest(unittest.TestCase):
             torch.allclose(refined.sum(dim=-1), torch.ones(5), atol=1e-6)
         )
 
-    def test_s1_cost_supervision_updates_graph_output_not_initial_gnn(self):
+    def test_h1_distillation_updates_h0_not_graph_output(self):
         model = Net(solution_graph_hidden=8, solution_graph_layers=2)
+        initial = self.previous.clone().requires_grad_()
         refined, _, _, _ = model.refine_heatmap(
-            self.previous,
+            initial,
             self.distances,
             self.archive,
             return_components=True,
         )
-        paths, costs, _ = self.archive.tensors()
-        loss = population_quality_kl(refined, paths.transpose(0, 1), costs)
+        loss = refinement_distillation_kl(initial, refined)
         loss.backward()
 
-        output_grad = model.solution_graph_net.output.weight.grad
-        self.assertIsNotNone(output_grad)
-        self.assertGreater(float(output_grad.abs().sum()), 0.0)
-        self.assertIsNone(model.emb_net.v_lin0.weight.grad)
+        self.assertIsNotNone(initial.grad)
+        self.assertGreater(float(initial.grad.abs().sum()), 0.0)
+        self.assertIsNone(model.solution_graph_net.output.weight.grad)
 
     def test_graph_residual_is_bounded(self):
         model = Net(solution_graph_hidden=8, solution_graph_layers=2)

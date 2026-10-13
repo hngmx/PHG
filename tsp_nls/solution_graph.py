@@ -9,9 +9,9 @@ equivalent hypergraph incidence representation instead:
     edge node <-> sampled solution (hyperedge)
 
 Two edge nodes are related exactly when they share at least one solution
-hyperedge. ``SolutionArchive`` retains unique solutions across visits to the
-same training instance; rotation/reversal duplicates refresh recency in place.
-Optional caps can prune older rounds or lower-ranked tours.
+hyperedge. ``SolutionArchive`` retains every sampled feasible solution across
+visits to the same training instance, including repeated tours. Optional caps
+can prune older rounds or lower-ranked observations.
 """
 
 from __future__ import annotations
@@ -24,14 +24,13 @@ EPS = 1e-10
 
 
 class SolutionArchive:
-    """Keep unique feasible tours, matching costs, and latest sampling rounds."""
+    """Keep all feasible sampled tours with their costs and sampling rounds."""
 
     def __init__(
         self,
         n_nodes: int,
         storage_device=None,
         path_dtype=None,
-        deduplicate=True,
         max_solutions=None,
         max_rounds=None,
     ):
@@ -40,7 +39,6 @@ class SolutionArchive:
             None if storage_device is None else torch.device(storage_device)
         )
         self.path_dtype = path_dtype
-        self.deduplicate = deduplicate
         if max_solutions is not None and max_solutions < 1:
             raise ValueError("archive solution limit must be positive")
         if max_rounds is not None and max_rounds < 1:
@@ -58,7 +56,6 @@ class SolutionArchive:
         self._costs = []
         self._rounds = []
         self._next_round = 0
-        self._tour_locations = {}
         # Each sampling round contributes one compact edge-key population to
         # the online hypergraph accumulator.  Historical paths remain available
         # for inspection, but H1 no longer rebuilds their full incidence graph.
@@ -66,20 +63,14 @@ class SolutionArchive:
         self._round_costs = []
         self._online_statistics_cache = {}
 
-    def _rebuild_unique_storage(self, paths, costs, rounds):
-        """Replace compact unique-tour storage and rebuild dedupe locations."""
+    def _replace_storage(self, paths, costs, rounds):
+        """Replace compact storage after explicit archive pruning."""
         self._paths = [paths]
         self._costs = [costs]
         self._rounds = [rounds]
-        self._tour_locations = {}
-        if not self.deduplicate:
-            return
-        key_tours = paths.to(device="cpu", dtype=torch.int32).contiguous()
-        for row_index, row in enumerate(key_tours):
-            self._tour_locations[row.numpy().tobytes()] = (0, row_index)
 
     def _enforce_limits(self):
-        """Bound raw round history and unique full-tour storage."""
+        """Bound raw round history and full-tour storage when requested."""
         history_trimmed = False
         if (
             self.max_rounds is not None
@@ -134,7 +125,7 @@ class SolutionArchive:
             selection = selection.index_select(0, keep)
 
         if selection.numel() != paths.size(0) or history_trimmed:
-            self._rebuild_unique_storage(
+            self._replace_storage(
                 paths.index_select(0, selection),
                 costs.index_select(0, selection.to(costs.device)),
                 rounds.index_select(0, selection.to(rounds.device)),
@@ -151,9 +142,9 @@ class SolutionArchive:
     def add(self, paths: torch.Tensor, costs: torch.Tensor):
         """Append one feasible solution population to the archive.
 
-        Tours that differ only by cyclic rotation or reversal represent the
-        same undirected TSP solution.  Only one copy is stored; seeing it again
-        refreshes its round and keeps its best matching cost.
+        Store every sampled feasible tour as observed, including identical,
+        rotated, and reversed tours. Each occurrence retains its own cost and
+        sampling round.
 
         Args:
             paths: ``[n_nodes, n_ants]`` sampled tours.
@@ -176,89 +167,9 @@ class SolutionArchive:
             raise ValueError(
                 "every archived TSP solution must be a permutation of all nodes"
             )
-        # Rotate every tour to start at node 0, then choose the lexicographically
-        # smaller orientation.  With distinct nodes, comparing the second and
-        # final node is sufficient to choose between the two orientations.
-        offsets = torch.arange(self.n_nodes, device=tours.device)
-        positions = (offsets.unsqueeze(0) + tours.argmin(dim=1, keepdim=True))
-        positions = positions.remainder(self.n_nodes)
-        tours = tours.gather(1, positions)
-        if self.n_nodes > 2:
-            reversed_tours = torch.cat(
-                (tours[:, :1], torch.flip(tours[:, 1:], dims=(1,))),
-                dim=1,
-            )
-            use_reverse = tours[:, 1] > tours[:, -1]
-            tours = torch.where(use_reverse.unsqueeze(1), reversed_tours, tours)
-
         detached_costs = costs.detach().clone()
-        if self.deduplicate:
-            key_tours = tours.to(device="cpu", dtype=torch.int32).contiguous()
-            batch_keys = {}
-            for index, row in enumerate(key_tours):
-                batch_keys[row.numpy().tobytes()] = index
-
-            observation_indices = list(batch_keys.values())
-            observation_selection = torch.tensor(
-                observation_indices,
-                device=tours.device,
-                dtype=torch.long,
-            )
-            observation_tours = tours.index_select(0, observation_selection)
-            observation_costs = detached_costs.index_select(
-                0, observation_selection.to(detached_costs.device)
-            )
-
-            new_keys = []
-            new_indices = []
-            for key, index in batch_keys.items():
-                location = self._tour_locations.get(key)
-                if location is None:
-                    new_keys.append(key)
-                    new_indices.append(index)
-                    continue
-
-                chunk_index, row_index = location
-                stored_cost = self._costs[chunk_index][row_index]
-                candidate_cost = detached_costs[index].to(stored_cost.device)
-                self._costs[chunk_index][row_index] = torch.minimum(
-                    stored_cost,
-                    candidate_cost.to(dtype=stored_cost.dtype),
-                )
-                self._rounds[chunk_index][row_index] = self._next_round
-
-            if not new_indices:
-                observation_u = observation_tours
-                observation_v = torch.roll(
-                    observation_tours, shifts=-1, dims=1
-                )
-                observation_lo = torch.minimum(observation_u, observation_v)
-                observation_hi = torch.maximum(observation_u, observation_v)
-                observation_edge_keys = (
-                    observation_lo * self.n_nodes + observation_hi
-                )
-                self._round_edge_keys.append(
-                    observation_edge_keys.to(device="cpu", dtype=torch.int32)
-                )
-                self._round_costs.append(
-                    observation_costs.to(device="cpu", dtype=torch.float32)
-                )
-                self._next_round += 1
-                self._enforce_limits()
-                return {"added": 0, "duplicates": paths.size(1)}
-
-            selection = torch.tensor(new_indices, device=tours.device)
-            tours = tours.index_select(0, selection)
-            detached_costs = detached_costs.index_select(
-                0, selection.to(detached_costs.device)
-            )
-        else:
-            new_keys = []
-            observation_tours = tours
-            observation_costs = detached_costs
-
-        observation_u = observation_tours
-        observation_v = torch.roll(observation_tours, shifts=-1, dims=1)
+        observation_u = tours
+        observation_v = torch.roll(tours, shifts=-1, dims=1)
         observation_lo = torch.minimum(observation_u, observation_v)
         observation_hi = torch.maximum(observation_u, observation_v)
         observation_edge_keys = observation_lo * self.n_nodes + observation_hi
@@ -266,7 +177,7 @@ class SolutionArchive:
             observation_edge_keys.to(device="cpu", dtype=torch.int32)
         )
         self._round_costs.append(
-            observation_costs.to(device="cpu", dtype=torch.float32)
+            detached_costs.to(device="cpu", dtype=torch.float32)
         )
 
         if self.storage_device is not None:
@@ -285,15 +196,11 @@ class SolutionArchive:
         self._paths.append(tours)
         self._costs.append(detached_costs)
         self._rounds.append(rounds)
-        if self.deduplicate:
-            chunk_index = len(self._paths) - 1
-            for row_index, key in enumerate(new_keys):
-                self._tour_locations[key] = (chunk_index, row_index)
         self._next_round += 1
         self._enforce_limits()
         return {
             "added": tours.size(0),
-            "duplicates": paths.size(1) - tours.size(0),
+            "duplicates": 0,
         }
 
     def online_edge_statistics(
@@ -447,9 +354,8 @@ class SolutionArchive:
 class InstanceSearchState:
     """Heatmap and cumulative hypergraph state owned by one problem instance.
 
-    Training may carry the archive and previous H1 into a new visit of the same
-    instance.  Search still starts from that visit's fresh H0, while the carried
-    H1 only contributes to the heatmap prior used for its sole refinement.
+    Training carries only the archive into a new visit of the same instance.
+    Search and the sole refinement both start from that visit's fresh H0.
     """
 
     def __init__(
@@ -770,29 +676,93 @@ def quality_target_heatmap(
 
 
 def graph_refined_heatmap(
-    previous_heatmap,
+    fresh_h0_heatmap,
     archive: SolutionArchive,
-    distances=None,
-    temperature=0.75,
-    age_decay=0.1,
-    uniform_mix=0.01,
-    elite_ratio=0.25,
-    prior_strength=0.5,
-    propagation_strength=0.1,
-    distance_prior_strength=0.1,
+    prior_strength=0.1,
+    layers=2,
 ):
-    """Public name for the deterministic solution-graph heatmap update."""
-    return quality_target_heatmap(
-        previous_heatmap,
-        archive,
-        distances=distances,
-        temperature=temperature,
-        age_decay=age_decay,
-        uniform_mix=uniform_mix,
-        elite_ratio=elite_ratio,
-        prior_strength=prior_strength,
-        propagation_strength=propagation_strength,
-        distance_prior_strength=distance_prior_strength,
+    """Two-layer, parameter-free weighted GCN on the archived edge graph.
+
+    A graph node represents an undirected TSP edge. Its initial scalar feature
+    is the mean of 1 / tour_cost over all archived tour occurrences containing it.
+    Two graph nodes have co-occurrence weight
+    ``A[e, f] = sum_{tour contains e,f} 1 / tour_cost``. The incidence form
+    computes symmetric-normalized GCN messages without materializing cliques.
+    Historical tours have exactly the same statistical role as new tours: no
+    age or round decay is applied.
+    """
+    if fresh_h0_heatmap.dim() != 2 or (
+        fresh_h0_heatmap.size(0) != fresh_h0_heatmap.size(1)
+    ):
+        raise ValueError("fresh H0 heatmap must be square")
+    if not 0 <= prior_strength <= 1:
+        raise ValueError("prior strength must be between 0 and 1")
+    if layers < 1:
+        raise ValueError("GCN layers must be positive")
+    if len(archive) == 0:
+        raise ValueError("the edge graph needs at least one sampled solution")
+
+    paths, costs, _ = archive.tensors()
+    n_nodes = fresh_h0_heatmap.size(0)
+    if paths.size(1) != n_nodes:
+        raise ValueError("archive and heatmap node counts must match")
+    paths = paths.to(device=fresh_h0_heatmap.device, dtype=torch.long)
+    costs = costs.to(
+        device=fresh_h0_heatmap.device,
+        dtype=fresh_h0_heatmap.dtype,
+    )
+    inverse_costs = costs.clamp_min(EPS).reciprocal()
+    n_solutions = paths.size(0)
+    next_nodes = torch.roll(paths, shifts=-1, dims=1)
+    edge_u = torch.minimum(paths, next_nodes)
+    edge_v = torch.maximum(paths, next_nodes)
+    edge_keys = (edge_u * n_nodes + edge_v).reshape(-1)
+    unique_keys, edge_incidence = torch.unique(
+        edge_keys, sorted=True, return_inverse=True
+    )
+    solution_incidence = torch.arange(
+        n_solutions, device=paths.device
+    ).repeat_interleave(n_nodes)
+    incidence_inverse_cost = inverse_costs.index_select(
+        0, solution_incidence
+    )
+    n_edges = unique_keys.numel()
+    support_sum = inverse_costs.new_zeros(n_edges)
+    support_sum.index_add_(0, edge_incidence, incidence_inverse_cost)
+    counts = inverse_costs.new_zeros(n_edges)
+    counts.index_add_(0, edge_incidence, torch.ones_like(incidence_inverse_cost))
+    initial = support_sum / counts.clamp_min(1.0)
+
+    # The weighted co-occurrence graph is A = B diag(1/cost) B^T, including
+    # self-loops. Every tour has n_nodes edges, so D[e] = n_nodes * support[e].
+    degree_sqrt = (n_nodes * support_sum).clamp_min(EPS).sqrt()
+    hidden = initial
+    for _ in range(layers):
+        normalized_edges = hidden / degree_sqrt
+        solution_messages = hidden.new_zeros(n_solutions)
+        solution_messages.index_add_(
+            0,
+            solution_incidence,
+            normalized_edges.index_select(0, edge_incidence),
+        )
+        edge_messages = hidden.new_zeros(n_edges)
+        edge_messages.index_add_(
+            0,
+            edge_incidence,
+            incidence_inverse_cost
+            * solution_messages.index_select(0, solution_incidence),
+        )
+        hidden = 0.5 * hidden + 0.5 * (edge_messages / degree_sqrt)
+
+    output_u = torch.div(unique_keys, n_nodes, rounding_mode="floor")
+    output_v = unique_keys.remainder(n_nodes)
+    graph_heatmap = hidden.new_zeros((n_nodes, n_nodes))
+    graph_heatmap[output_u, output_v] = hidden
+    graph_heatmap[output_v, output_u] = hidden
+    graph_heatmap = normalize_heatmap_rows(graph_heatmap)
+    prior = normalize_heatmap_rows(fresh_h0_heatmap.detach())
+    return normalize_heatmap_rows(
+        (1.0 - prior_strength) * graph_heatmap + prior_strength * prior
     )
 
 
@@ -830,91 +800,12 @@ def refinement_distillation_kl(previous_heatmap, refined_heatmap):
     instead of pulling the refined heatmap back to its input or allowing both
     sides to collapse to the same uninformative distribution.
     """
-    # H0 is produced only on the compressed candidate graph.  Entries outside
-    # that support are constant epsilon padding and cannot be learned, so KL is
-    # evaluated only where H0 has trainable candidate-edge predictions.
+    # With an explicitly sparse candidate graph, entries outside H0's support
+    # are constant epsilon padding and cannot be learned. The default full
+    # graph has trainable predictions for every non-self edge.
     support_mask = previous_heatmap.detach() > (10.0 * EPS)
     return rowwise_heatmap_kl(
         previous_heatmap,
         refined_heatmap.detach(),
-        support_mask=support_mask,
-    )
-
-
-def population_quality_heatmap(
-    paths,
-    costs,
-    temperature=0.75,
-    elite_ratio=0.25,
-    uniform_mix=0.01,
-):
-    """Build a detached edge target from one actual ACO population."""
-    if paths.dim() != 2:
-        raise ValueError("population paths must have shape [n_nodes, n_ants]")
-    if costs.dim() != 1 or costs.numel() != paths.size(1):
-        raise ValueError("population costs must match the number of paths")
-    if not 0 < elite_ratio <= 1:
-        raise ValueError("elite ratio must be in (0, 1]")
-
-    elite_count = max(
-        1,
-        int(torch.ceil(torch.tensor(costs.numel() * elite_ratio))),
-    )
-    elite_indices = torch.topk(
-        costs,
-        k=elite_count,
-        largest=False,
-        sorted=False,
-    ).indices
-    elite_paths = paths.index_select(1, elite_indices.to(paths.device))
-    elite_costs = costs.index_select(0, elite_indices.to(costs.device))
-    weights = compute_quality_weights(
-        elite_costs,
-        torch.zeros_like(elite_costs, dtype=torch.long),
-        num_rounds=1,
-        temperature=temperature,
-        age_decay=0.0,
-        uniform_mix=uniform_mix,
-    ).to(device=paths.device, dtype=torch.float32)
-
-    n_nodes = paths.size(0)
-    tours = elite_paths.transpose(0, 1).to(dtype=torch.long)
-    u = tours
-    v = torch.roll(tours, shifts=-1, dims=1)
-    edge_weights = weights.repeat_interleave(n_nodes)
-    target = edge_weights.new_zeros((n_nodes, n_nodes))
-    target.index_put_(
-        (u.reshape(-1), v.reshape(-1)),
-        edge_weights,
-        accumulate=True,
-    )
-    target.index_put_(
-        (v.reshape(-1), u.reshape(-1)),
-        edge_weights,
-        accumulate=True,
-    )
-    return normalize_heatmap_rows(target).detach()
-
-
-def population_quality_kl(
-    predicted_heatmap,
-    paths,
-    costs,
-    temperature=0.75,
-    elite_ratio=0.25,
-    uniform_mix=0.01,
-    support_mask=None,
-):
-    """Supervise a sampling heatmap from the real costs it produced."""
-    target = population_quality_heatmap(
-        paths,
-        costs,
-        temperature=temperature,
-        elite_ratio=elite_ratio,
-        uniform_mix=uniform_mix,
-    ).to(device=predicted_heatmap.device, dtype=predicted_heatmap.dtype)
-    return rowwise_heatmap_kl(
-        predicted_heatmap,
-        target,
         support_mask=support_mask,
     )

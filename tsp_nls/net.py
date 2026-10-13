@@ -211,13 +211,7 @@ class Net(nn.Module):
         current_heatmap,
         distances,
         archive,
-        quality_temperature=0.75,
-        age_decay=0.1,
-        uniform_mix=0.01,
-        elite_ratio=0.25,
-        prior_strength=0.5,
-        propagation_strength=0.1,
-        distance_prior_strength=0.1,
+        prior_strength=0.1,
         max_solutions=None,
         refinement_mode="full",
         return_components=False,
@@ -225,23 +219,15 @@ class Net(nn.Module):
         """Combine deterministic aggregation with a learned bounded residual."""
         if refinement_mode not in REFINEMENT_MODES:
             raise ValueError(f"unknown refinement mode: {refinement_mode}")
-        # The search state is deliberately detached.  H0 distillation updates
-        # the initial GNN, while S1 cost supervision updates this graph network
-        # through the residual only.
+        # The search state is detached. With only H1-to-H0 distillation, this
+        # updater is a fixed teacher and the optional residual is not trained.
         current_heatmap = current_heatmap.detach()
         distances = distances.detach()
         if refinement_mode in {"deterministic", "full"}:
             base_heatmap = graph_refined_heatmap(
                 current_heatmap,
                 archive,
-                distances=distances,
-                temperature=quality_temperature,
-                age_decay=age_decay,
-                uniform_mix=uniform_mix,
-                elite_ratio=elite_ratio,
                 prior_strength=prior_strength,
-                propagation_strength=propagation_strength,
-                distance_prior_strength=distance_prior_strength,
             )
         else:
             base_heatmap = normalize_heatmap_rows(current_heatmap)
@@ -254,9 +240,7 @@ class Net(nn.Module):
                 distances,
                 archive,
                 max_solutions=max_solutions,
-                temperature=quality_temperature,
-                age_decay=age_decay,
-                uniform_mix=uniform_mix,
+                age_decay=0.0,
             )
             residual = self.solution_graph_net(graph)
         refined = normalize_heatmap_rows(base_heatmap.detach() + residual)

@@ -10,8 +10,7 @@ from solution_graph import (
     SolutionArchive,
     compute_quality_weights,
     graph_refined_heatmap,
-    population_quality_heatmap,
-    population_quality_kl,
+    normalize_heatmap_rows,
     quality_target_heatmap,
     refinement_distillation_kl,
 )
@@ -56,7 +55,7 @@ class SolutionGraphTest(unittest.TestCase):
         for _ in range(11):
             archive.add(path, torch.tensor([5.0]))
 
-        self.assertEqual(len(archive), 1)
+        self.assertEqual(len(archive), 11)
         self.assertEqual(archive.num_rounds, 11)
         self.assertEqual(len(archive._round_edge_keys), 11)
 
@@ -94,7 +93,7 @@ class SolutionGraphTest(unittest.TestCase):
         self.assertEqual(len(archive), 2)
         self.assertEqual(archive.num_rounds, 2)
 
-    def test_archive_enforces_unique_solution_limit(self):
+    def test_archive_enforces_solution_limit(self):
         archive = SolutionArchive(n_nodes=5, max_solutions=2, max_rounds=10)
         archive.add(
             torch.tensor(
@@ -136,7 +135,7 @@ class SolutionGraphTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(direct).all())
         self.assertTrue(torch.isfinite(propagated).all())
 
-    def test_archive_deduplicates_rotated_and_reversed_tours(self):
+    def test_archive_keeps_rotated_and_reversed_tours_as_sampled(self):
         archive = SolutionArchive(n_nodes=5)
         first = archive.add(
             torch.tensor([[0], [1], [2], [3], [4]]),
@@ -156,14 +155,19 @@ class SolutionGraphTest(unittest.TestCase):
         )
 
         self.assertEqual(first, {"added": 1, "duplicates": 0})
-        self.assertEqual(second, {"added": 0, "duplicates": 2})
-        self.assertEqual(len(archive), 1)
+        self.assertEqual(second, {"added": 2, "duplicates": 0})
+        self.assertEqual(len(archive), 3)
         self.assertEqual(archive.num_rounds, 2)
-        _, _, rounds = archive.tensors()
-        self.assertEqual(rounds.item(), 1)
+        tours, costs, rounds = archive.tensors()
+        self.assertTrue(torch.equal(tours, torch.tensor([
+            [0, 1, 2, 3, 4],
+            [2, 3, 4, 0, 1],
+            [0, 4, 3, 2, 1],
+        ])))
+        self.assertEqual(costs.tolist(), [5.0, 5.0, 5.0])
+        self.assertEqual(rounds.tolist(), [0, 1, 1])
 
-        # Duplicate observations are not re-stored as full archive paths, but
-        # they still count as a new sampling round in the online statistics.
+        # All observations also contribute to the per-round statistics.
         archive.online_edge_statistics(age_decay=0.05)
         cache = next(iter(archive._online_statistics_cache.values()))
         self.assertEqual(cache["processed_rounds"], 2)
@@ -316,42 +320,6 @@ class SolutionGraphTest(unittest.TestCase):
             )
         )
 
-    def test_population_cost_target_favors_the_better_actual_tour(self):
-        paths = torch.tensor(
-            [
-                [0, 0],
-                [1, 2],
-                [2, 1],
-                [3, 4],
-                [4, 3],
-            ]
-        )
-        costs = torch.tensor([5.0, 8.0])
-        target = population_quality_heatmap(
-            paths,
-            costs,
-            elite_ratio=0.5,
-        )
-
-        self.assertGreater(float(target[0, 1]), float(target[0, 2]))
-        self.assertTrue(
-            torch.allclose(target.sum(dim=-1), torch.ones(5), atol=1e-6)
-        )
-        self.assertTrue(torch.isfinite(target).all())
-
-    def test_population_cost_loss_updates_sampling_heatmap_only(self):
-        predicted = (torch.rand(5, 5) + 0.1).requires_grad_()
-        paths = torch.tensor([[0], [1], [2], [3], [4]])
-        costs = torch.tensor([5.0])
-
-        loss = population_quality_kl(predicted, paths, costs)
-        loss.backward()
-
-        self.assertIsNotNone(predicted.grad)
-        self.assertGreater(float(predicted.grad.abs().sum()), 0.0)
-        self.assertFalse(paths.requires_grad)
-        self.assertFalse(costs.requires_grad)
-
     def test_elite_filter_excludes_non_elite_tour_edges(self):
         archive = SolutionArchive(n_nodes=5)
         archive.add(
@@ -415,11 +383,108 @@ class SolutionGraphTest(unittest.TestCase):
         target = graph_refined_heatmap(
             previous.detach(),
             archive,
-            propagation_strength=0.5,
+            layers=2,
         )
 
         self.assertFalse(target.requires_grad)
         self.assertTrue(torch.isfinite(target).all())
+
+    def test_default_h1_mix_uses_ninety_percent_graph_and_fresh_h0(self):
+        archive = SolutionArchive(n_nodes=5)
+        archive.add(
+            torch.tensor([[0], [1], [2], [3], [4]]),
+            torch.tensor([5.0]),
+        )
+        fresh_h0 = torch.ones(5, 5) - torch.eye(5)
+        fresh_h0[0, 1] = 4.0
+        graph_only = graph_refined_heatmap(
+            fresh_h0, archive, prior_strength=0.0
+        )
+        expected = normalize_heatmap_rows(
+            0.9 * graph_only + 0.1 * normalize_heatmap_rows(fresh_h0)
+        )
+
+        self.assertTrue(torch.allclose(
+            graph_refined_heatmap(fresh_h0, archive), expected, atol=1e-6
+        ))
+
+    def test_statistical_gcn_matches_inverse_cost_mean_and_cooccurrence(self):
+        archive = SolutionArchive(n_nodes=5)
+        paths = torch.tensor([
+            [0, 0], [1, 2], [2, 1], [3, 3], [4, 4],
+        ])
+        costs = torch.tensor([2.0, 4.0])
+        archive.add(paths, costs)
+        prior = torch.ones(5, 5) - torch.eye(5)
+
+        actual = graph_refined_heatmap(
+            prior, archive, prior_strength=0.0, layers=1
+        )
+
+        tours = paths.transpose(0, 1)
+        observed_edges = sorted({
+            tuple(sorted((int(a), int(b))))
+            for tour in tours
+            for a, b in zip(tour.tolist(), torch.roll(tour, -1).tolist())
+        })
+        membership = torch.tensor([
+            [float(edge in {
+                tuple(sorted((int(a), int(b))))
+                for a, b in zip(tour.tolist(), torch.roll(tour, -1).tolist())
+            }) for tour in tours]
+            for edge in observed_edges
+        ])
+        inverse_costs = costs.reciprocal()
+        initial = (membership @ inverse_costs) / membership.sum(dim=1)
+        adjacency = (membership * inverse_costs) @ membership.T
+        degree = adjacency.sum(dim=1)
+        aggregated = (
+            adjacency @ (initial / degree.sqrt())
+        ) / degree.sqrt()
+        hidden = 0.5 * initial + 0.5 * aggregated
+        expected = torch.zeros(5, 5)
+        for edge, value in zip(observed_edges, hidden):
+            expected[edge[0], edge[1]] = value
+            expected[edge[1], edge[0]] = value
+        expected = expected / expected.sum(dim=1, keepdim=True)
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-6))
+
+    def test_statistical_gcn_does_not_decay_old_solutions(self):
+        paths = torch.tensor([
+            [0, 0], [1, 2], [2, 1], [3, 3], [4, 4],
+        ])
+        costs = torch.tensor([2.0, 4.0])
+        first = SolutionArchive(n_nodes=5)
+        first.add(paths, costs)
+        split_rounds = SolutionArchive(n_nodes=5)
+        split_rounds.add(paths[:, :1], costs[:1])
+        split_rounds.add(paths[:, 1:], costs[1:])
+        prior = torch.ones(5, 5) - torch.eye(5)
+
+        self.assertTrue(torch.allclose(
+            graph_refined_heatmap(prior, first, prior_strength=0.0),
+            graph_refined_heatmap(prior, split_rounds, prior_strength=0.0),
+            atol=1e-6,
+        ))
+
+    def test_statistical_gcn_counts_repeated_sampled_tours(self):
+        paths = torch.tensor([
+            [0, 0], [1, 2], [2, 1], [3, 3], [4, 4],
+        ])
+        costs = torch.tensor([2.0, 4.0])
+        first = SolutionArchive(n_nodes=5)
+        first.add(paths, costs)
+        repeated = SolutionArchive(n_nodes=5)
+        repeated.add(paths, costs)
+        repeated.add(paths[:, :1], costs[:1])
+        prior = torch.ones(5, 5) - torch.eye(5)
+
+        self.assertEqual(len(repeated), 3)
+        self.assertFalse(torch.allclose(
+            graph_refined_heatmap(prior, first, prior_strength=0.0),
+            graph_refined_heatmap(prior, repeated, prior_strength=0.0),
+            atol=1e-6,
+        ))
 
     def test_learnable_graph_uses_bounded_quality_ranked_archive(self):
         archive = SolutionArchive(n_nodes=5)

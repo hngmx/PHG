@@ -60,6 +60,11 @@ class ACOSolutionSampler:
     def set_heatmap(self, heatmap):
         self._aco.set_heuristic(heatmap)
 
+    def probe(self, inference=False):
+        """Sample initial costs without advancing ACO, as in DeepACO validation."""
+        costs, _, _ = self._aco.sample(inference=inference, require_prob=False)
+        return costs
+
     def sample(
         self,
         inference=False,
