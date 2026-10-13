@@ -4,3 +4,11 @@ exp*
 .vscode
 data/*
 .DS_Store
+
+# Generated presentation/chart artifacts and local analysis outputs.
+/.chart-data-*/
+/.codex-phg-ppt-*/
+/.codex-ppt-*/
+/.codex_ppt_build/
+/.codex_train_*/
+/outputs/*.pptx
