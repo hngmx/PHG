@@ -16,7 +16,7 @@ from training_pool import (
     iter_pool_batches,
     refresh_training_pool,
 )
-from utils import load_val_dataset
+from utils import default_k_sparse, load_val_dataset
 
 
 EPS = 1e-10
@@ -68,7 +68,7 @@ def resolve_training_profile(
         defaults = {
             "lr": 1e-4,
             "epochs": 3,
-            "k_sparse": nodes - 1,
+            "k_sparse": default_k_sparse(nodes),
             "train_pool_size": 400,
             "pretrained": os.path.join(PRETRAINED_DIR, "tsp100-best.pt"),
             "output": os.path.join(
@@ -79,7 +79,7 @@ def resolve_training_profile(
         defaults = {
             "lr": 3e-4,
             "epochs": 20,
-            "k_sparse": nodes - 1,
+            "k_sparse": default_k_sparse(nodes),
             "train_pool_size": 400,
             "pretrained": None,
             "output": PRETRAINED_DIR,
@@ -322,7 +322,7 @@ def train(
         raise ValueError(
             "learned graph solution limit cannot exceed archive capacity"
         )
-    k_sparse = n_node - 1 if k_sparse is None else k_sparse
+    k_sparse = default_k_sparse(n_node) if k_sparse is None else k_sparse
     required_pool_size = steps_per_epoch * batch_size
     if train_pool_size is None:
         train_pool_size = required_pool_size
@@ -439,7 +439,7 @@ if __name__ == "__main__":
         choices=("standard", TSP100_FINETUNE_PROFILE),
         default="standard",
         help=(
-            "Training defaults. tsp100_finetune uses a full candidate graph and a low learning "
+            "Training defaults. tsp100_finetune uses k=10 and a low learning "
             "rate with the 400-instance pool; explicit flags override it"
         ),
     )
@@ -476,7 +476,7 @@ if __name__ == "__main__":
         "--k_sparse",
         type=int,
         default=None,
-        help="Candidate neighbors per node (default: full graph, nodes - 1)",
+        help="Candidate neighbors per node (default: max(1, nodes // 10))",
     )
     parser.add_argument(
         "--train_pool_size",

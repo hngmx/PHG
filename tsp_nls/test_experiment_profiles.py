@@ -9,7 +9,7 @@ import torch
 import test as test_entrypoint
 import train as train_entrypoint
 from solution_graph import InstanceSearchState
-from utils import gen_pyg_data
+from utils import default_k_sparse, gen_pyg_data
 from train import (
     DEFAULT_GRAPH_ROUNDS,
     H0_VALIDATION_ITERATIONS,
@@ -25,6 +25,12 @@ from train import (
 class TrainingProfileTest(unittest.TestCase):
     def test_default_training_uses_one_heatmap_refinement(self):
         self.assertEqual(DEFAULT_GRAPH_ROUNDS, 1)
+
+    def test_default_candidate_size_matches_original_deepaco(self):
+        self.assertEqual(default_k_sparse(50), 5)
+        self.assertEqual(default_k_sparse(100), 10)
+        self.assertEqual(default_k_sparse(200), 20)
+        self.assertEqual(default_k_sparse(9), 1)
 
     def test_training_rejects_extra_heatmap_refinements(self):
         validate_graph_rounds(1)
@@ -258,7 +264,7 @@ class TrainingProfileTest(unittest.TestCase):
 
         output = StringIO()
         with (
-            patch.object(test_entrypoint, "load_test_dataset", return_value=[None, None]),
+            patch.object(test_entrypoint, "load_test_dataset", return_value=[None, None]) as load_dataset,
             patch.object(test_entrypoint, "Net", FakeNet),
             patch.object(test_entrypoint.torch, "load", return_value={}),
             patch.object(test_entrypoint, "test", return_value=([8.0, 7.0], 1.5)),
@@ -278,6 +284,7 @@ class TrainingProfileTest(unittest.TestCase):
             "T=2, average cost is 7.0.",
         ])
         self.assertFalse(any("sampling backend:" in line for line in lines))
+        self.assertEqual(load_dataset.call_args.args[1], 5)
 
     def test_pool_modes_resolve_expected_refresh_fraction(self):
         self.assertEqual(pool_refresh_fraction_for_mode("fixed"), 0.0)
@@ -291,7 +298,7 @@ class TrainingProfileTest(unittest.TestCase):
 
         self.assertEqual(resolved["lr"], 3e-4)
         self.assertEqual(resolved["epochs"], 20)
-        self.assertEqual(resolved["k_sparse"], 49)
+        self.assertEqual(resolved["k_sparse"], 5)
         self.assertEqual(resolved["train_pool_size"], 400)
 
     def test_tsp100_finetune_profile_uses_400_instance_pool(self):
@@ -299,7 +306,7 @@ class TrainingProfileTest(unittest.TestCase):
 
         self.assertEqual(resolved["lr"], 1e-4)
         self.assertEqual(resolved["epochs"], 3)
-        self.assertEqual(resolved["k_sparse"], 99)
+        self.assertEqual(resolved["k_sparse"], 10)
         self.assertEqual(resolved["train_pool_size"], 400)
         self.assertTrue(resolved["pretrained"].endswith("tsp100-best.pt"))
         self.assertTrue(
@@ -312,14 +319,14 @@ class TrainingProfileTest(unittest.TestCase):
             "tsp100_finetune",
             lr=2e-4,
             epochs=5,
-            k_sparse=10,
+            k_sparse=17,
             output="custom-output",
         )
 
         self.assertEqual(resolved["lr"], 2e-4)
         self.assertEqual(resolved["epochs"], 5)
         self.assertEqual(resolved["output"], "custom-output")
-        self.assertEqual(resolved["k_sparse"], 10)
+        self.assertEqual(resolved["k_sparse"], 17)
 
     def test_full_candidate_graph_excludes_only_self_edges(self):
         coordinates = torch.tensor([

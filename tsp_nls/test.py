@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from net import Net
 from solution_sampler import ACOSolutionSampler
-from utils import load_test_dataset
+from utils import default_k_sparse, load_test_dataset
 
 
 EPS = 1e-10
@@ -119,7 +119,7 @@ def main(
     sampling_backend="torch",
     test_size=None,
 ):
-    k_sparse = k_sparse if k_sparse is not None else n_node - 1
+    k_sparse = default_k_sparse(n_node) if k_sparse is None else k_sparse
     test_list = load_test_dataset(n_node, k_sparse, device, start_node=0)
     if test_size is not None:
         test_list = test_list[:test_size]
@@ -172,7 +172,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--k_sparse", type=int, default=None,
-        help="Candidate neighbors per node (default: full graph, nodes - 1); must match training",
+        help="Candidate neighbors per node (default: max(1, nodes // 10)); must match training",
     )
     parser.add_argument(
         "--seed", type=int, default=1234,

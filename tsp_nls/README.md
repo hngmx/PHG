@@ -34,18 +34,19 @@ as the distillation target, so the H0 loss trains the current initial GNN.
 Historical H1 heatmaps are neither stored nor mixed into later visits, and no
 extra H2 is generated.
 
-By default, the initial GNN receives a full directed candidate graph:
-`k_sparse = N - 1` neighbors per node (49 for TSP50, 99 for TSP100), excluding
-self-loops. This increases GNN computation and memory relative to the former
-nearest-neighbor graph. A sampler is accessed through the interface in
+By default, the initial GNN receives a nearest-neighbor candidate
+graph: `k_sparse = max(1, N // 10)` (5 for TSP50, 10 for TSP100), excluding
+self-loops. Every sampled TSP tour still visits all N nodes; noncandidate
+edges have a tiny fallback heuristic so construction can always finish.
+Pass `--k_sparse N-1` explicitly to use a full graph. A sampler is accessed through the interface in
 `solution_sampler.py`; ACO sampling is used directly and local search is
 disabled by default but available as a matched baseline. A different constrained decoder can return the same
 `SolutionBatch` fields.
 
-Distinct feasible ACO tours are retained across visits to the same training
-instance. Cyclic rotations and reversed
-orientations of the same undirected tour are stored once; observing a duplicate
-does not add another statistical sample:
+Every feasible ACO tour is retained across visits to the same training
+instance. Repeated, rotated, and reversed tours are stored as separate
+observations with their own costs, so each occurrence contributes to the
+statistical graph:
 
 - a graph node is one undirected TSP edge observed in a sampled tour;
 - a sampled tour is a hyperedge connecting all of its TSP-edge nodes;
@@ -57,7 +58,7 @@ validates that every stored TSP tour is a permutation of all nodes.
 
 H1 is constructed from the statistical edge graph using a two-layer,
 parameter-free weighted GCN. For an edge node `e`, its initial value uses
-**all distinct archived tours** containing that edge:
+**all archived sampled tours** containing that edge:
 
 ```text
 x_e = mean_{s contains e} (1 / cost(s))
@@ -161,10 +162,11 @@ $ python3 train.py 100 --profile tsp100_finetune
 ```
 
 This explicit profile starts from `../pretrained/tsp_nls/tsp100-best.pt` and
-uses `k_sparse=99` (full TSP100 graph), `lr=1e-4`, 3 epochs, 48 ants,
+uses `k_sparse=10`, `lr=1e-4`, 3 epochs, 48 ants,
 1 S0 ACO population, 1 graph refinement, H0-only validation, and a
 fixed pool of 400 instances. It writes checkpoints to
-`../pretrained/tsp_nls/optimized_v3_full_finetune`. Individual command-line
+`../pretrained/tsp_nls/optimized_v3_full_finetune` (an unchanged legacy
+directory name). Individual command-line
 flags still override profile values. The profile is deliberately restricted
 to TSP100, but the revised pipeline still requires multi-seed validation.
 
@@ -184,8 +186,8 @@ $ python3 train.py 1000 --graph_rounds 1 --kl_weight 1.0
 ```
 
 `--graph_rounds` must be 1; training samples S0 once and constructs H1 once.
-The default candidate size is `N - 1`, matching a full graph in both training
-and testing. An explicit `--k_sparse` overrides this default.
+The default candidate size is `max(1, N // 10)` in both training and testing.
+An explicit `--k_sparse` overrides this default.
 `--kl_weight` is the only loss weight and must be positive.
 `--train_pool_size` controls the fixed pool size,
 defaults to 400, and must equal `--steps * --batch_size` so every pool member
@@ -243,7 +245,7 @@ When training uses a non-default candidate size, pass the same value at test
 time, for example:
 
 ```raw
-$ python3 test.py 100 --k_sparse 10
+$ python3 test.py 100 --k_sparse 99
 ```
 
 This is an H0/S0 evaluation, not an evaluation of H1 or the optional learned

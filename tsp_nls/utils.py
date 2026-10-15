@@ -2,6 +2,11 @@ import os
 import torch
 from torch_geometric.data import Data
 
+
+def default_k_sparse(n_nodes):
+    """Use DeepACO's N//10 nearest-neighbor default (at least one edge)."""
+    return max(1, n_nodes // 10)
+
 def gen_distance_matrix(tsp_coordinates):
     '''
     Args:
