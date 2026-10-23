@@ -4,12 +4,13 @@ from torch.nn import functional as F
 import torch_geometric.nn as gnn
 
 from solution_graph import (
+    build_local_edge_gcn_graph,
     build_learnable_solution_graph,
     graph_refined_heatmap,
     normalize_heatmap_rows,
 )
 
-REFINEMENT_MODES = ("h0", "deterministic", "learned", "full")
+REFINEMENT_MODES = ("h0", "local_gcn", "deterministic", "learned", "full")
 
 # GNN for edge embeddings
 class EmbNet(nn.Module):
@@ -180,12 +181,60 @@ class SolutionGraphNet(nn.Module):
         )
         return residual
 
+
+class LocalEdgeGCN(nn.Module):
+    """Trainable GCN over compatible TSP edges and their fragment features."""
+
+    def __init__(self, hidden=32, layers=2):
+        super().__init__()
+        if layers < 1:
+            raise ValueError("local GCN layers must be positive")
+        self.convs = nn.ModuleList([
+            gnn.GCNConv(3 if index == 0 else hidden, hidden)
+            for index in range(layers)
+        ])
+        self.relation_gate = nn.Sequential(
+            nn.Linear(7, hidden), nn.SiLU(), nn.Linear(hidden, 1),
+        )
+        # A zero logit gives every relation its original positive base weight.
+        nn.init.zeros_(self.relation_gate[-1].weight)
+        nn.init.zeros_(self.relation_gate[-1].bias)
+        self.output = nn.Linear(hidden, 1)
+        # Initially reproduce the smoothed sampled-edge prior.
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(self, graph):
+        hidden = graph["edge_features"]
+        relation_weight = graph["edge_weight"] * (
+            2.0 * torch.sigmoid(
+                self.relation_gate(graph["relation_features"]).squeeze(-1)
+            )
+        )
+        for conv in self.convs:
+            hidden = F.silu(conv(
+                hidden, graph["edge_index"], relation_weight,
+            ))
+        edge_logits = self.output(hidden).squeeze(-1)
+        edge_scores = graph["edge_prior"] * torch.exp(
+            4.0 * torch.tanh(edge_logits)
+        )
+        n_nodes = graph["n_nodes"]
+        heatmap = edge_scores.new_zeros((n_nodes, n_nodes))
+        heatmap[graph["edge_u"], graph["edge_v"]] = edge_scores
+        heatmap[graph["edge_v"], graph["edge_u"]] = edge_scores
+        if graph["candidate"] is not None:
+            heatmap = heatmap.masked_fill(~graph["candidate"], 0.0)
+        return normalize_heatmap_rows(heatmap)
+
 class Net(nn.Module):
     def __init__(
         self,
         solution_graph_hidden=32,
         solution_graph_layers=2,
         solution_graph_max_residual=0.25,
+        local_gcn_hidden=32,
+        local_gcn_layers=2,
     ):
         super().__init__()
         self.emb_net = EmbNet()
@@ -194,6 +243,10 @@ class Net(nn.Module):
             hidden=solution_graph_hidden,
             layers=solution_graph_layers,
             max_residual=solution_graph_max_residual,
+        )
+        self.local_edge_gcn = LocalEdgeGCN(
+            hidden=local_gcn_hidden,
+            layers=local_gcn_layers,
         )
 
     @property
@@ -211,23 +264,62 @@ class Net(nn.Module):
         current_heatmap,
         distances,
         archive,
-        prior_strength=0.1,
         max_solutions=None,
-        refinement_mode="full",
+        refinement_mode="local_gcn",
         return_components=False,
+        graph_structure="whole_tour",
+        graph_layers=2,
+        graph_quality_mode=None,
+        graph_quality_temperature=0.1,
+        graph_diversity_strength=0.5,
+        graph_candidate_only=False,
+        graph_pheromone=None,
+        graph_incident_topk=6,
     ):
-        """Combine deterministic aggregation with a learned bounded residual."""
+        """Construct H1 from the local GCN or a legacy graph ablation."""
         if refinement_mode not in REFINEMENT_MODES:
             raise ValueError(f"unknown refinement mode: {refinement_mode}")
-        # The search state is detached. With only H1-to-H0 distillation, this
-        # updater is a fixed teacher and the optional residual is not trained.
+        if graph_quality_mode is None:
+            graph_quality_mode = (
+                "relative_diversity"
+                if refinement_mode == "local_gcn" else "inverse_cost"
+            )
+        # The search state is detached; H1 supervision trains the local GCN
+        # while the separate, detached H1-to-H0 KL trains the initial network.
         current_heatmap = current_heatmap.detach()
         distances = distances.detach()
+        if refinement_mode == "local_gcn":
+            graph = build_local_edge_gcn_graph(
+                current_heatmap,
+                distances,
+                archive,
+                max_solutions=max_solutions,
+                quality_mode=graph_quality_mode,
+                quality_temperature=graph_quality_temperature,
+                diversity_strength=graph_diversity_strength,
+                candidate_only=graph_candidate_only,
+                pheromone=graph_pheromone,
+                incident_topk=graph_incident_topk,
+            )
+            refined = self.local_edge_gcn(graph)
+            base_scores = torch.zeros_like(current_heatmap)
+            base_scores[graph["edge_u"], graph["edge_v"]] = graph["edge_prior"]
+            base_scores[graph["edge_v"], graph["edge_u"]] = graph["edge_prior"]
+            if graph["candidate"] is not None:
+                base_scores = base_scores.masked_fill(~graph["candidate"], 0.0)
+            base = normalize_heatmap_rows(base_scores)
+            if return_components:
+                return refined, base, refined - base, graph
+            return refined
         if refinement_mode in {"deterministic", "full"}:
             base_heatmap = graph_refined_heatmap(
                 current_heatmap,
                 archive,
-                prior_strength=prior_strength,
+                structure=graph_structure,
+                layers=graph_layers,
+                quality_mode=graph_quality_mode,
+                quality_temperature=graph_quality_temperature,
+                candidate_only=graph_candidate_only,
             )
         else:
             base_heatmap = normalize_heatmap_rows(current_heatmap)

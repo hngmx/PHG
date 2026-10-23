@@ -5,6 +5,7 @@ from unittest.mock import patch
 import torch
 
 from solution_graph import (
+    EPS,
     build_learnable_solution_graph,
     InstanceSearchState,
     SolutionArchive,
@@ -269,14 +270,13 @@ class SolutionGraphTest(unittest.TestCase):
             archive,
             temperature=0.5,
             uniform_mix=0.0,
-            prior_strength=0.0,
         )
 
         # Edge (0, 1) occurs only in the lower-cost tour, whereas edge (0, 2)
         # occurs only in the higher-cost tour.
         self.assertGreater(float(target[0, 1]), float(target[0, 2]))
 
-    def test_quality_target_defaults_to_equal_new_and_previous_mix(self):
+    def test_quality_target_does_not_mix_previous_heatmap_values(self):
         archive = SolutionArchive(n_nodes=5)
         archive.add(
             torch.tensor([[0], [1], [2], [3], [4]]),
@@ -291,33 +291,24 @@ class SolutionGraphTest(unittest.TestCase):
                 [5.0, 1.0, 1.0, 1.0, 0.0],
             ]
         )
-        equal_mix = quality_target_heatmap(
+        first_target = quality_target_heatmap(
             previous,
             archive,
             propagation_strength=0.0,
             distance_prior_strength=0.0,
         )
-        graph_only = quality_target_heatmap(
-            previous,
+        changed_previous = previous.clone()
+        changed_previous[0, 1] = 100.0
+        changed_previous[2, 4] = 0.01
+        second_target = quality_target_heatmap(
+            changed_previous,
             archive,
-            prior_strength=0.0,
-            propagation_strength=0.0,
-            distance_prior_strength=0.0,
-        )
-        previous_only = quality_target_heatmap(
-            previous,
-            archive,
-            prior_strength=1.0,
             propagation_strength=0.0,
             distance_prior_strength=0.0,
         )
 
         self.assertTrue(
-            torch.allclose(
-                equal_mix,
-                0.5 * (graph_only + previous_only),
-                atol=1e-6,
-            )
+            torch.allclose(first_target, second_target, atol=1e-6)
         )
 
     def test_elite_filter_excludes_non_elite_tour_edges(self):
@@ -363,7 +354,6 @@ class SolutionGraphTest(unittest.TestCase):
             previous,
             archive,
             distances=distances,
-            prior_strength=0.0,
             propagation_strength=0.0,
             distance_prior_strength=1.0,
         )
@@ -389,23 +379,21 @@ class SolutionGraphTest(unittest.TestCase):
         self.assertFalse(target.requires_grad)
         self.assertTrue(torch.isfinite(target).all())
 
-    def test_default_h1_mix_uses_ninety_percent_graph_and_fresh_h0(self):
+    def test_h1_graph_result_does_not_mix_fresh_h0_values(self):
         archive = SolutionArchive(n_nodes=5)
         archive.add(
             torch.tensor([[0], [1], [2], [3], [4]]),
             torch.tensor([5.0]),
         )
-        fresh_h0 = torch.ones(5, 5) - torch.eye(5)
-        fresh_h0[0, 1] = 4.0
-        graph_only = graph_refined_heatmap(
-            fresh_h0, archive, prior_strength=0.0
-        )
-        expected = normalize_heatmap_rows(
-            0.9 * graph_only + 0.1 * normalize_heatmap_rows(fresh_h0)
-        )
+        first_h0 = torch.ones(5, 5) - torch.eye(5)
+        second_h0 = first_h0.clone()
+        second_h0[0, 1] = 100.0
+        second_h0[2, 4] = 0.01
 
         self.assertTrue(torch.allclose(
-            graph_refined_heatmap(fresh_h0, archive), expected, atol=1e-6
+            graph_refined_heatmap(first_h0, archive),
+            graph_refined_heatmap(second_h0, archive),
+            atol=1e-6,
         ))
 
     def test_statistical_gcn_matches_inverse_cost_mean_and_cooccurrence(self):
@@ -418,7 +406,7 @@ class SolutionGraphTest(unittest.TestCase):
         prior = torch.ones(5, 5) - torch.eye(5)
 
         actual = graph_refined_heatmap(
-            prior, archive, prior_strength=0.0, layers=1
+            prior, archive, layers=1
         )
 
         tours = paths.transpose(0, 1)
@@ -449,6 +437,127 @@ class SolutionGraphTest(unittest.TestCase):
         expected = expected / expected.sum(dim=1, keepdim=True)
         self.assertTrue(torch.allclose(actual, expected, atol=1e-6))
 
+    def test_local_edge_graph_matches_explicit_consecutive_adjacency(self):
+        archive = SolutionArchive(n_nodes=5)
+        paths = torch.tensor([
+            [0, 0], [1, 2], [2, 1], [3, 3], [4, 4],
+        ])
+        costs = torch.tensor([2.0, 4.0])
+        archive.add(paths, costs)
+        prior = torch.ones(5, 5) - torch.eye(5)
+        actual = graph_refined_heatmap(
+            prior, archive, layers=1,
+            structure="local",
+        )
+
+        tours = paths.transpose(0, 1)
+        tour_edges = [
+            [tuple(sorted((int(a), int(b)))) for a, b in zip(
+                tour.tolist(), torch.roll(tour, -1).tolist(),
+            )]
+            for tour in tours
+        ]
+        observed_edges = sorted(set().union(*(set(edges) for edges in tour_edges)))
+        indices = {edge: index for index, edge in enumerate(observed_edges)}
+        initial = torch.tensor([
+            sum(float(cost.reciprocal()) for edges, cost in zip(tour_edges, costs)
+                if edge in edges)
+            / sum(edge in edges for edges in tour_edges)
+            for edge in observed_edges
+        ])
+        adjacency = torch.zeros(len(observed_edges), len(observed_edges))
+        for edges, cost in zip(tour_edges, costs):
+            weight = float(cost.reciprocal())
+            for position, edge in enumerate(edges):
+                source = indices[edge]
+                neighbor = indices[edges[(position + 1) % len(edges)]]
+                adjacency[source, source] += weight
+                adjacency[source, neighbor] += weight
+                adjacency[neighbor, source] += weight
+        degree = adjacency.sum(dim=1)
+        hidden = 0.5 * initial + 0.5 * (
+            adjacency @ (initial / degree.sqrt())
+        ) / degree.sqrt()
+        expected = torch.zeros(5, 5)
+        for edge, value in zip(observed_edges, hidden):
+            expected[edge[0], edge[1]] = value
+            expected[edge[1], edge[0]] = value
+        expected = normalize_heatmap_rows(expected)
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-6))
+        self.assertFalse(torch.allclose(
+            actual,
+            graph_refined_heatmap(prior, archive, layers=1),
+        ))
+
+    def test_relative_quality_graph_favors_better_route_and_keeps_duplicates(self):
+        paths = torch.tensor([
+            [0, 0], [1, 2], [2, 1], [3, 3], [4, 4],
+        ])
+        costs = torch.tensor([2.0, 4.0])
+        archive = SolutionArchive(n_nodes=5)
+        archive.add(paths, costs)
+        repeated = SolutionArchive(n_nodes=5)
+        repeated.add(paths, costs)
+        repeated.add(paths[:, :1], costs[:1])
+        prior = torch.ones(5, 5) - torch.eye(5)
+        kwargs = dict(
+            layers=1, structure="local",
+            quality_mode="relative", quality_temperature=0.1,
+        )
+        target = graph_refined_heatmap(prior, archive, **kwargs)
+        repeated_target = graph_refined_heatmap(prior, repeated, **kwargs)
+
+        self.assertGreater(float(target[0, 1]), float(target[0, 2]))
+        self.assertFalse(torch.allclose(target, repeated_target, atol=1e-6))
+        self.assertTrue(torch.isfinite(target).all())
+
+    def test_candidate_only_graph_restricts_nodes_and_directed_output(self):
+        archive = SolutionArchive(n_nodes=5)
+        archive.add(
+            torch.tensor([
+                [0, 0], [1, 2], [2, 1], [3, 3], [4, 4],
+            ]),
+            torch.tensor([2.0, 4.0]),
+        )
+        prior = torch.full((5, 5), EPS)
+        candidate_edges = ((0, 1), (1, 2), (2, 3), (3, 4), (4, 0))
+        for u, v in candidate_edges:
+            prior[u, v] = 1.0
+            prior[v, u] = 1.0
+        support = prior > 10.0 * EPS
+        kwargs = dict(
+            layers=1, structure="local",
+            quality_mode="relative", quality_temperature=0.1,
+        )
+        restricted = graph_refined_heatmap(
+            prior, archive, candidate_only=True, **kwargs,
+        )
+        projected_unrestricted = normalize_heatmap_rows(
+            graph_refined_heatmap(prior, archive, **kwargs).masked_fill(
+                ~support, 0.0,
+            ),
+        )
+
+        self.assertLessEqual(float(restricted[~support].max()), 2.0 * EPS)
+        self.assertTrue(torch.isfinite(restricted).all())
+        self.assertFalse(torch.allclose(
+            restricted, projected_unrestricted, atol=1e-6,
+        ))
+
+    def test_candidate_only_graph_never_falls_back_to_h0_values(self):
+        archive = SolutionArchive(n_nodes=5)
+        archive.add(
+            torch.tensor([[0], [1], [2], [3], [4]]),
+            torch.tensor([5.0]),
+        )
+        h0 = torch.full((5, 5), EPS)
+        for u, v in ((0, 2), (2, 4), (4, 1), (1, 3), (3, 0)):
+            h0[u, v] = 1.0
+            h0[v, u] = 1.0
+
+        with self.assertRaisesRegex(ValueError, "no observed candidate-edge"):
+            graph_refined_heatmap(h0, archive, candidate_only=True)
+
     def test_statistical_gcn_does_not_decay_old_solutions(self):
         paths = torch.tensor([
             [0, 0], [1, 2], [2, 1], [3, 3], [4, 4],
@@ -462,8 +571,8 @@ class SolutionGraphTest(unittest.TestCase):
         prior = torch.ones(5, 5) - torch.eye(5)
 
         self.assertTrue(torch.allclose(
-            graph_refined_heatmap(prior, first, prior_strength=0.0),
-            graph_refined_heatmap(prior, split_rounds, prior_strength=0.0),
+            graph_refined_heatmap(prior, first),
+            graph_refined_heatmap(prior, split_rounds),
             atol=1e-6,
         ))
 
@@ -481,8 +590,8 @@ class SolutionGraphTest(unittest.TestCase):
 
         self.assertEqual(len(repeated), 3)
         self.assertFalse(torch.allclose(
-            graph_refined_heatmap(prior, first, prior_strength=0.0),
-            graph_refined_heatmap(prior, repeated, prior_strength=0.0),
+            graph_refined_heatmap(prior, first),
+            graph_refined_heatmap(prior, repeated),
             atol=1e-6,
         ))
 

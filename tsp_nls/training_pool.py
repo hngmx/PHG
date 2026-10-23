@@ -1,4 +1,4 @@
-"""Persistent per-instance state used by KL-only TSP training."""
+"""Persistent per-instance state for TSP training with an H1 teacher."""
 
 from dataclasses import dataclass
 from typing import Optional

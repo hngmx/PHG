@@ -14,10 +14,14 @@ class ACO():
                  pheromone=None,
                  heuristic=None,
                  min=None,
-                 device='cpu'
+                 device='cpu',
+                 start_node=None,
                  ):
         
         self.problem_size = len(distances)
+        if start_node is not None and not 0 <= start_node < self.problem_size:
+            raise ValueError("start_node must be in [0, problem_size) or None")
+        self.start_node = start_node
         self.distances  = distances
         self.n_ants = n_ants
         self.decay = decay
@@ -48,6 +52,11 @@ class ACO():
 
         self.device = device
 
+    def set_heuristic(self, heuristic):
+        if heuristic.shape != self.distances.shape:
+            raise ValueError("heuristic shape must match the distance matrix")
+        self.heuristic = heuristic.to(self.distances.device)
+
     @torch.no_grad()
     def sparsify(self, k_sparse):
         '''
@@ -71,23 +80,38 @@ class ACO():
         costs = self.gen_path_costs(paths)
         return costs, log_probs
 
+    def sample_iteration(self, require_prob=False):
+        """Run one complete ACO iteration; no local search in the TSP variant.
+
+        Return the same raw/feasible tuple layout as tsp_nls.ACO so the S0
+        population used for REINFORCE also updates pheromone before H1 is built.
+        """
+        generated = self.gen_path(require_prob=require_prob)
+        if require_prob:
+            paths, log_probs = generated
+        else:
+            paths, log_probs = generated, None
+        costs = self.gen_path_costs(paths)
+        self.update_best(paths, costs)
+        self.update_pheronome(paths, costs)
+        return costs, costs, log_probs, paths, paths
+
+    @torch.no_grad()
+    def update_best(self, paths, costs):
+        best_cost, best_idx = costs.min(dim=0)
+        if best_cost < self.lowest_cost:
+            self.shortest_path = paths[:, best_idx]
+            self.lowest_cost = best_cost
+            if self.min_max:
+                maximum = self.problem_size / self.lowest_cost
+                if self.max is None:
+                    self.pheromone *= maximum / self.pheromone.max()
+                self.max = maximum
+
     @torch.no_grad()
     def run(self, n_iterations):
         for _ in range(n_iterations):
-            paths = self.gen_path(require_prob=False)
-            costs = self.gen_path_costs(paths)
-            
-            best_cost, best_idx = costs.min(dim=0)
-            if best_cost < self.lowest_cost:
-                self.shortest_path = paths[:, best_idx]
-                self.lowest_cost = best_cost
-                if self.min_max:
-                    max = self.problem_size / self.lowest_cost
-                    if self.max is None:
-                        self.pheromone *= max/self.pheromone.max()
-                    self.max = max
-            
-            self.update_pheronome(paths, costs)
+            self.sample_iteration(require_prob=False)
 
         return self.lowest_cost
        
@@ -138,7 +162,11 @@ class ACO():
             paths: torch tensor with shape (problem_size, n_ants), paths[:, i] is the constructed tour of the ith ant
             log_probs: torch tensor with shape (problem_size, n_ants), log_probs[i, j] is the log_prob of the ith action of the jth ant
         '''
-        start = torch.randint(low=0, high=self.problem_size, size=(self.n_ants,), device=self.device)
+        start = (
+            torch.randint(low=0, high=self.problem_size, size=(self.n_ants,), device=self.device)
+            if self.start_node is None
+            else torch.full((self.n_ants,), self.start_node, dtype=torch.long, device=self.device)
+        )
         mask = torch.ones(size=(self.n_ants, self.problem_size), device=self.device)
         mask[torch.arange(self.n_ants, device=self.device), start] = 0
         

@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from net import Net, REFINEMENT_MODES
-from solution_graph import refinement_distillation_kl
+from solution_graph import refinement_distillation_kl, rowwise_heatmap_kl
 from solution_sampler import ACOSolutionSampler
 from test import infer_instance as infer_h0_test_instance
 from training_pool import (
@@ -21,15 +21,25 @@ from utils import default_k_sparse, load_val_dataset
 
 EPS = 1e-10
 DEFAULT_GRAPH_ROUNDS = 1
+DEFAULT_KL_WEIGHT = 0.03
+DEFAULT_REINFORCE_WEIGHT = 0.1
 H0_VALIDATION_ITERATIONS = 10
 PRETRAINED_DIR = "../pretrained/tsp_nls"
 TSP100_FINETUNE_PROFILE = "tsp100_finetune"
 
 
 def validate_graph_rounds(graph_rounds):
-    """Each training visit samples S0 and constructs exactly one H1."""
+    """Allow at most one H0-to-H1 update, when the KL objective is enabled."""
     if graph_rounds != DEFAULT_GRAPH_ROUNDS:
         raise ValueError("training supports exactly one H0 -> H1 refinement")
+
+
+def resolve_loss_weights(n_node, kl_weight=None, reinforce_weight=None):
+    """Use the same KL and REINFORCE defaults at every problem size."""
+    return (
+        DEFAULT_KL_WEIGHT if kl_weight is None else kl_weight,
+        DEFAULT_REINFORCE_WEIGHT if reinforce_weight is None else reinforce_weight,
+    )
 
 
 def pool_refresh_fraction_for_mode(mode, mixed_fraction=0.5):
@@ -125,6 +135,30 @@ def isolated_random_seed(seed):
             torch.cuda.set_rng_state_all(cuda_states)
 
 
+def validate_loss_weights(kl_weight, reinforce_weight):
+    if kl_weight < 0 or reinforce_weight < 0:
+        raise ValueError("loss weights must be non-negative")
+    if kl_weight == 0 and reinforce_weight == 0:
+        raise ValueError("at least one training loss weight must be positive")
+
+
+def reinforce_cost_loss(costs, log_probs):
+    """Minimize expected sampled-tour length with a leave-one-out baseline."""
+    if log_probs is None:
+        raise ValueError("REINFORCE requires differentiable log probabilities")
+    if costs.ndim != 1 or log_probs.ndim != 2:
+        raise ValueError("expected costs [ants] and log probabilities [steps, ants]")
+    if log_probs.size(1) != costs.numel():
+        raise ValueError("cost and log-probability ant counts must match")
+    costs = costs.detach()
+    if costs.numel() == 1:
+        baseline = torch.zeros_like(costs)
+    else:
+        baseline = (costs.sum() - costs) / (costs.numel() - 1)
+    advantage = (costs - baseline).detach()
+    return (advantage * log_probs.sum(dim=0)).mean()
+
+
 def train_instance(
     model,
     optimizer,
@@ -132,66 +166,125 @@ def train_instance(
     n_ants,
     k_sparse,
     graph_rounds=DEFAULT_GRAPH_ROUNDS,
-    kl_weight=1.0,
-    quality_prior_strength=0.1,
+    kl_weight=DEFAULT_KL_WEIGHT,
+    reinforce_weight=DEFAULT_REINFORCE_WEIGHT,
     max_solution_graph_solutions=None,
     max_archive_solutions=None,
     max_archive_rounds=None,
-    refinement_mode="deterministic",
+    refinement_mode="local_gcn",
     local_search=None,
     sampler_factory=ACOSolutionSampler,
+    graph_structure="whole_tour",
+    graph_layers=2,
+    graph_quality_mode=None,
+    graph_quality_temperature=0.1,
+    graph_diversity_strength=0.5,
+    graph_candidate_only=False,
+    graph_supervision_weight=1.0,
+    loss_stats=None,
 ):
-    """Train H0 to imitate the detached H1 built from a single S0 population."""
+    """Train H0 from one S0 population with KL, REINFORCE, or both."""
     validate_graph_rounds(graph_rounds)
-    if kl_weight <= 0:
-        raise ValueError("KL weight must be positive when it is the only loss")
+    validate_loss_weights(kl_weight, reinforce_weight)
+    if refinement_mode == "local_gcn" and kl_weight > 0 and graph_supervision_weight <= 0:
+        raise ValueError("local GCN requires a positive graph supervision weight")
+    if not data:
+        raise ValueError("training batch must contain at least one instance")
     model.train()
-    sum_loss = 0.0
-    count = 0
+    optimizer.zero_grad()
 
     for training_instance in data:
         pyg_data, distances = training_instance.materialize(k_sparse, device)
         heu_vec = model(pyg_data)
         initial_heatmap = model.reshape(pyg_data, heu_vec) + EPS
-        state = training_instance.start_visit(
-            initial_heatmap,
-            archive_max_solutions=max_archive_solutions,
-            archive_max_rounds=max_archive_rounds,
-        )
+        state = None
+        if kl_weight > 0:
+            state = training_instance.start_visit(
+                initial_heatmap,
+                archive_max_solutions=max_archive_solutions,
+                archive_max_rounds=max_archive_rounds,
+            )
 
         sampler = sampler_factory(
             n_solutions=n_ants,
-            heatmap=state.current_heatmap.to(device),
+            # The persistent state stores a detached H0. REINFORCE must use
+            # this visit's live H0 so sampled log probabilities reach the GNN.
+            heatmap=(
+                initial_heatmap if reinforce_weight > 0
+                else state.current_heatmap.to(device)
+            ),
             distances=distances,
             device=device,
             local_search=local_search,
         )
 
-        solutions = sampler.sample(inference=False, require_log_probs=False)
-        state.add_feasible_solutions(
-            solutions.feasible_paths,
-            solutions.feasible_costs,
+        solutions = sampler.sample(
+            inference=False, require_log_probs=reinforce_weight > 0,
         )
-        # H1 is a fixed teacher. No S1 population is sampled and no gradient
-        # passes through the archive, deterministic update, or residual model.
-        with torch.no_grad():
-            refined_heatmap, _, _, _ = model.refine_heatmap(
-                state.initial_heatmap.to(model.device),
-                distances,
-                state.archive,
-                prior_strength=quality_prior_strength,
-                max_solutions=max_solution_graph_solutions,
-                refinement_mode=refinement_mode,
-                return_components=True,
+        instance_loss = 0.0
+        if reinforce_weight > 0:
+            reinforce_loss = reinforce_cost_loss(
+                solutions.sampled_costs, solutions.log_probs,
             )
-        kl_loss = refinement_distillation_kl(initial_heatmap, refined_heatmap)
-        sum_loss += kl_weight * kl_loss
-        count += 1
+            instance_loss = reinforce_weight * reinforce_loss
+            if loss_stats is not None:
+                loss_stats["reinforce_sum"] += reinforce_loss.detach()
+        if kl_weight > 0:
+            state.add_feasible_solutions(
+                solutions.feasible_paths,
+                solutions.feasible_costs,
+            )
+            if refinement_mode == "local_gcn":
+                refined_heatmap, _, _, graph = model.refine_heatmap(
+                    state.initial_heatmap.to(model.device),
+                    distances,
+                    state.archive,
+                    max_solutions=max_solution_graph_solutions,
+                    refinement_mode=refinement_mode,
+                    return_components=True,
+                    graph_structure=graph_structure,
+                    graph_layers=graph_layers,
+                    graph_quality_mode=graph_quality_mode,
+                    graph_quality_temperature=graph_quality_temperature,
+                    graph_diversity_strength=graph_diversity_strength,
+                    graph_candidate_only=graph_candidate_only,
+                    graph_pheromone=getattr(sampler, "pheromone", None),
+                )
+                graph_target = graph.get("quality_target") if isinstance(graph, dict) else None
+                if graph_target is None:
+                    raise RuntimeError("local GCN must return a graph quality target")
+                graph_loss = rowwise_heatmap_kl(refined_heatmap, graph_target)
+                instance_loss = instance_loss + graph_supervision_weight * graph_loss
+                if loss_stats is not None:
+                    loss_stats["graph_sum"] += graph_loss.detach()
+            else:
+                # Legacy teachers are fixed; their optional residual is frozen.
+                with torch.no_grad():
+                    refined_heatmap, _, _, _ = model.refine_heatmap(
+                        state.initial_heatmap.to(model.device),
+                        distances,
+                        state.archive,
+                        max_solutions=max_solution_graph_solutions,
+                        refinement_mode=refinement_mode,
+                        return_components=True,
+                        graph_structure=graph_structure,
+                        graph_layers=graph_layers,
+                        graph_quality_mode=graph_quality_mode,
+                        graph_quality_temperature=graph_quality_temperature,
+                        graph_diversity_strength=graph_diversity_strength,
+                        graph_candidate_only=graph_candidate_only,
+                    )
+            kl_loss = refinement_distillation_kl(initial_heatmap, refined_heatmap)
+            instance_loss = instance_loss + kl_weight * kl_loss
+            if loss_stats is not None:
+                loss_stats["kl_sum"] += kl_loss.detach()
+        # Backpropagating each instance separately avoids retaining every ant's
+        # sampling graph for all 20 instances in a training batch.
+        (instance_loss / len(data)).backward()
         training_instance.finish_visit()
+        if loss_stats is not None:
+            loss_stats["count"] += 1
 
-    sum_loss = sum_loss / count
-    optimizer.zero_grad()
-    sum_loss.backward()
     torch.nn.utils.clip_grad_norm_(
         parameters=model.parameters(), max_norm=3.0, norm_type=2
     )
@@ -207,14 +300,26 @@ def train_epoch(
     training_pool,
     batch_size=1,
     graph_rounds=DEFAULT_GRAPH_ROUNDS,
-    kl_weight=1.0,
-    quality_prior_strength=0.1,
+    kl_weight=DEFAULT_KL_WEIGHT,
+    reinforce_weight=DEFAULT_REINFORCE_WEIGHT,
     max_solution_graph_solutions=None,
     max_archive_solutions=None,
     max_archive_rounds=None,
-    refinement_mode="deterministic",
+    refinement_mode="local_gcn",
     local_search=None,
+    graph_structure="whole_tour",
+    graph_layers=2,
+    graph_quality_mode=None,
+    graph_quality_temperature=0.1,
+    graph_diversity_strength=0.5,
+    graph_candidate_only=False,
+    graph_supervision_weight=1.0,
+    collect_loss_values=False,
 ):
+    loss_stats = (
+        {"kl_sum": 0.0, "reinforce_sum": 0.0, "graph_sum": 0.0, "count": 0}
+        if collect_loss_values else None
+    )
     for training_batch in iter_pool_batches(
         training_pool,
         steps=steps_per_epoch,
@@ -228,13 +333,32 @@ def train_epoch(
             k_sparse,
             graph_rounds=graph_rounds,
             kl_weight=kl_weight,
-            quality_prior_strength=quality_prior_strength,
+            reinforce_weight=reinforce_weight,
             max_solution_graph_solutions=max_solution_graph_solutions,
             max_archive_solutions=max_archive_solutions,
             max_archive_rounds=max_archive_rounds,
             refinement_mode=refinement_mode,
             local_search=local_search,
+            graph_structure=graph_structure,
+            graph_layers=graph_layers,
+            graph_quality_mode=graph_quality_mode,
+            graph_quality_temperature=graph_quality_temperature,
+            graph_diversity_strength=graph_diversity_strength,
+            graph_candidate_only=graph_candidate_only,
+            graph_supervision_weight=graph_supervision_weight,
+            loss_stats=loss_stats,
         )
+    if loss_stats is not None:
+        if loss_stats["count"] == 0:
+            raise ValueError("cannot report losses for an empty training epoch")
+        return {
+            "kl": float(loss_stats["kl_sum"] / loss_stats["count"]),
+            "reinforce": float(
+                loss_stats["reinforce_sum"] / loss_stats["count"]
+            ),
+            "graph": float(loss_stats["graph_sum"] / loss_stats["count"]),
+        }
+    return None
 
 
 @torch.no_grad()
@@ -261,7 +385,7 @@ def validation_h0_only(
                 n_ants,
                 n_iterations=n_iterations,
                 local_search=local_search,
-                sampling_backend="torch",
+                sampling_backend="numba",
                 **({"return_training_metrics": True} if return_training_metrics else {}),
             )
             if return_training_metrics:
@@ -283,6 +407,27 @@ def format_training_epoch(epoch, training_metrics):
     return f"epoch {epoch}: {training_metrics}"
 
 
+def format_training_losses(
+    epoch, loss_values, kl_weight, reinforce_weight, graph_supervision_weight=1.0,
+):
+    """Show unweighted epoch means and their weighted loss contributions."""
+    kl_loss = loss_values["kl"]
+    reinforce_loss = loss_values["reinforce"]
+    message = (
+        f"epoch {epoch} losses: "
+        f"KL={kl_loss:.6g} (weighted={kl_weight * kl_loss:.6g}), "
+        f"REINFORCE={reinforce_loss:.6g} "
+        f"(weighted={reinforce_weight * reinforce_loss:.6g})"
+    )
+    if "graph" in loss_values:
+        graph_loss = loss_values["graph"]
+        message += (
+            f", GCN={graph_loss:.6g} "
+            f"(weighted={graph_supervision_weight * graph_loss:.6g})"
+        )
+    return message
+
+
 def train(
     n_node,
     n_ants,
@@ -294,26 +439,56 @@ def train(
     pretrained=None,
     savepath="../pretrained/tsp_nls",
     graph_rounds=DEFAULT_GRAPH_ROUNDS,
-    kl_weight=1.0,
-    quality_prior_strength=0.1,
+    kl_weight=None,
+    reinforce_weight=None,
     train_pool_size=400,
     max_solution_graph_solutions=None,
     max_archive_solutions=None,
     max_archive_rounds=None,
-    refinement_mode="deterministic",
+    refinement_mode="local_gcn",
     local_search=None,
     train_pool_mode="fixed",
     pool_refresh_fraction=0.5,
     seed=1234,
+    graph_structure="whole_tour",
+    graph_layers=2,
+    graph_quality_mode=None,
+    graph_quality_temperature=0.1,
+    graph_diversity_strength=0.5,
+    graph_candidate_only=False,
+    graph_supervision_weight=1.0,
+    show_loss_values=False,
+    probe_instances=0,
+    probe_repeats=3,
+    probe_seed=None,
+    probe_output=None,
 ):
     seed_everything(seed)
+    kl_weight, reinforce_weight = resolve_loss_weights(
+        n_node, kl_weight, reinforce_weight,
+    )
     validate_graph_rounds(graph_rounds)
-    if kl_weight <= 0:
-        raise ValueError("KL weight must be positive when it is the only loss")
+    validate_loss_weights(kl_weight, reinforce_weight)
     if refinement_mode == "h0":
         raise ValueError("h0 refinement mode is evaluation-only")
     if refinement_mode not in REFINEMENT_MODES:
         raise ValueError(f"unknown refinement mode: {refinement_mode}")
+    if graph_structure not in {"whole_tour", "local"}:
+        raise ValueError("unknown graph structure")
+    if graph_layers < 1 or graph_quality_temperature <= 0:
+        raise ValueError("graph layers and quality temperature must be positive")
+    if graph_quality_mode not in {None, "inverse_cost", "relative", "relative_diversity"}:
+        raise ValueError("unknown graph quality mode")
+    if graph_quality_mode == "relative_diversity" and refinement_mode != "local_gcn":
+        raise ValueError("relative_diversity requires local_gcn refinement")
+    if not 0 <= graph_diversity_strength <= 1:
+        raise ValueError("graph diversity strength must be between 0 and 1")
+    if refinement_mode == "local_gcn" and kl_weight > 0 and graph_supervision_weight <= 0:
+        raise ValueError("local GCN requires a positive graph supervision weight")
+    if probe_instances < 0 or probe_repeats < 1:
+        raise ValueError("probe instances must be non-negative and repeats positive")
+    if probe_instances and refinement_mode != "local_gcn":
+        raise ValueError("paired heatmap probe requires local_gcn refinement")
     if (
         max_solution_graph_solutions is not None
         and max_archive_solutions is not None
@@ -333,7 +508,7 @@ def train(
         )
 
     os.makedirs(savepath, exist_ok=True)
-    net = Net().to(device)
+    net = Net(local_gcn_layers=graph_layers).to(device)
     if pretrained:
         incompatible = net.load_state_dict(
             torch.load(pretrained, map_location=device), strict=False
@@ -379,6 +554,26 @@ def train(
     torch.save(best_state, init_path)
     print(format_training_epoch(0, training_metrics))
 
+    probe = None
+    if probe_instances:
+        from heatmap_probe import HeatmapProbe
+
+        probe = HeatmapProbe(
+            nodes=n_node, count=probe_instances, repeats=probe_repeats,
+            seed=seed + 200000 if probe_seed is None else probe_seed,
+            output=probe_output or os.path.join(savepath, "heatmap_probe"),
+            ants=n_ants, k_sparse=k_sparse, local_search=local_search,
+            refinement_mode=refinement_mode,
+            max_solution_graph_solutions=max_solution_graph_solutions,
+            max_archive_solutions=max_archive_solutions,
+            max_archive_rounds=max_archive_rounds,
+            graph_structure=graph_structure, graph_layers=graph_layers,
+            graph_quality_mode=graph_quality_mode,
+            graph_quality_temperature=graph_quality_temperature,
+            graph_diversity_strength=graph_diversity_strength,
+            graph_candidate_only=graph_candidate_only,
+        )
+
     sum_time = 0
     for epoch in range(1, epochs + 1):
         if epoch > 1:
@@ -387,7 +582,7 @@ def train(
                 resolved_refresh_fraction,
             )
         start = time.time()
-        train_epoch(
+        epoch_losses = train_epoch(
             n_ants,
             k_sparse,
             steps_per_epoch,
@@ -397,12 +592,20 @@ def train(
             batch_size=batch_size,
             graph_rounds=graph_rounds,
             kl_weight=kl_weight,
-            quality_prior_strength=quality_prior_strength,
+            reinforce_weight=reinforce_weight,
             max_solution_graph_solutions=max_solution_graph_solutions,
             max_archive_solutions=max_archive_solutions,
             max_archive_rounds=max_archive_rounds,
             refinement_mode=refinement_mode,
             local_search=local_search,
+            graph_structure=graph_structure,
+            graph_layers=graph_layers,
+            graph_quality_mode=graph_quality_mode,
+            graph_quality_temperature=graph_quality_temperature,
+            graph_diversity_strength=graph_diversity_strength,
+            graph_candidate_only=graph_candidate_only,
+            graph_supervision_weight=graph_supervision_weight,
+            collect_loss_values=show_loss_values,
         )
         sum_time += time.time() - start
         h0_stats, training_metrics = validation_h0_only(
@@ -414,6 +617,13 @@ def train(
             return_training_metrics=True,
         )
         print(format_training_epoch(epoch, training_metrics))
+        if show_loss_values:
+            print(format_training_losses(
+                epoch, epoch_losses, kl_weight, reinforce_weight,
+                graph_supervision_weight,
+            ))
+        if probe is not None:
+            probe.evaluate(epoch, net)
         scheduler.step()
         curr_result = h0_stats[-1]
         if curr_result <= best_result:
@@ -509,30 +719,79 @@ if __name__ == "__main__":
         "--graph_rounds",
         type=int,
         default=DEFAULT_GRAPH_ROUNDS,
-        help="Fixed at 1: each training visit refines H0 to H1 once",
+        help="Fixed at 1: construct one H1 when the KL loss is enabled",
     )
     parser.add_argument(
         "--kl_weight",
         "--distill_kl_weight",
         dest="kl_weight",
         type=float,
-        default=1.0,
-        help="Weight of KL(detached refined heatmap || H0)",
+        default=None,
+        help="Weight of KL(detached refined heatmap || H0) (default: 0.03 at every size)",
     )
     parser.add_argument(
-        "--quality_prior_strength",
+        "--reinforce_weight",
         type=float,
-        default=0.1,
-        help=(
-            "Fresh H0 share in the deterministic H1 update; default "
-            "0.1 gives 90% GCN graph result and 10% fresh H0"
-        ),
+        default=None,
+        help="Weight of S0 tour-cost REINFORCE loss (default: 0.1 at every size)",
+    )
+    parser.add_argument(
+        "--show_loss_values",
+        action="store_true",
+        help="Print per-epoch mean KL, REINFORCE, and GCN losses; off by default",
+    )
+    parser.add_argument(
+        "--probe_instances", type=int, default=0,
+        help="Number of separate fixed diagnostic instances (0 disables H0/H1 probe)",
+    )
+    parser.add_argument(
+        "--probe_repeats", type=int, default=3,
+        help="Independent frozen-pheromone populations per arm and instance",
+    )
+    parser.add_argument(
+        "--probe_seed", type=int, default=None,
+        help="Diagnostic pool and sampling seed (default: training seed + 200000)",
+    )
+    parser.add_argument(
+        "--probe_output", type=str, default=None,
+        help="Separate folder for paired-probe records and three ratio charts",
+    )
+    parser.add_argument(
+        "--graph_structure", choices=("whole_tour", "local"),
+        default="whole_tour",
+        help="Legacy fixed H1 relation: whole-tour or consecutive tour edges",
+    )
+    parser.add_argument(
+        "--graph_layers", type=int, default=2,
+        help="Number of local GCN or legacy fixed aggregation layers",
+    )
+    parser.add_argument(
+        "--graph_quality_mode",
+        choices=("inverse_cost", "relative", "relative_diversity"),
+        default=None,
+        help="H1 route weighting (default: relative_diversity for local_gcn; inverse_cost for legacy modes)",
+    )
+    parser.add_argument(
+        "--graph_quality_temperature", type=float, default=0.1,
+        help="Scale of relative route-quality weights (fraction of mean cost)",
+    )
+    parser.add_argument(
+        "--graph_diversity_strength", type=float, default=0.5,
+        help="Structural novelty contribution for relative_diversity (0 to 1)",
+    )
+    parser.add_argument(
+        "--graph_candidate_only", action="store_true",
+        help="Restrict H1 graph nodes and output to H0 candidate edges",
+    )
+    parser.add_argument(
+        "--graph_supervision_weight", type=float, default=1.0,
+        help="Weight of elite-tour edge supervision for the trainable local GCN",
     )
     parser.add_argument(
         "--max_solution_graph_solutions",
         type=int,
         default=None,
-        help="Optional learned-graph tour cap; default keeps all archived tours",
+        help="Optional graph tour cap; default keeps all archived tours",
     )
     parser.add_argument(
         "--max_archive_solutions",
@@ -549,17 +808,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--refinement_mode",
         choices=REFINEMENT_MODES,
-        default="deterministic",
+        default="local_gcn",
         help=(
-            "H1 teacher: deterministic uses fixed hypergraph aggregation; "
-            "learned/full use an existing frozen residual (not trained by KL)"
+            "H1 teacher: local_gcn trains a local edge GCN; deterministic "
+            "and learned/full retain the earlier fixed ablations"
         ),
     )
     parser.add_argument(
         "--local_search",
         choices=("none", "2opt", "nls"),
-        default="none",
-        help="Local-search baseline applied equally in training and validation",
+        default="nls",
+        help="Local search used in training and validation (default: nls)",
     )
     parser.add_argument("-t", "--test_size", type=int, default=None,
                         help="Number of instances used for validation")
@@ -593,6 +852,9 @@ if __name__ == "__main__":
     opt.pretrained = resolved["pretrained"]
     opt.output = resolved["output"]
     opt.local_search = None if opt.local_search == "none" else opt.local_search
+    opt.kl_weight, opt.reinforce_weight = resolve_loss_weights(
+        opt.nodes, opt.kl_weight, opt.reinforce_weight,
+    )
 
     if opt.graph_rounds != DEFAULT_GRAPH_ROUNDS:
         parser.error("--graph_rounds must be 1 (H0 -> H1 only)")
@@ -606,16 +868,30 @@ if __name__ == "__main__":
         parser.error("--pool_refresh_fraction must be between 0 and 1")
     if opt.k_sparse is not None and not 1 <= opt.k_sparse < opt.nodes:
         parser.error("--k_sparse must be in [1, nodes - 1]")
-    if opt.kl_weight <= 0:
-        parser.error("--kl_weight must be positive when it is the only loss")
-    if not 0 <= opt.quality_prior_strength <= 1:
-        parser.error("--quality_prior_strength must be between 0 and 1")
+    try:
+        validate_loss_weights(opt.kl_weight, opt.reinforce_weight)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if opt.graph_layers < 1:
+        parser.error("--graph_layers must be positive")
+    if opt.graph_quality_temperature <= 0:
+        parser.error("--graph_quality_temperature must be positive")
+    if not 0 <= opt.graph_diversity_strength <= 1:
+        parser.error("--graph_diversity_strength must be between 0 and 1")
+    if opt.graph_quality_mode == "relative_diversity" and opt.refinement_mode != "local_gcn":
+        parser.error("--graph_quality_mode relative_diversity requires local_gcn")
+    if opt.refinement_mode == "local_gcn" and opt.kl_weight > 0 and opt.graph_supervision_weight <= 0:
+        parser.error("--graph_supervision_weight must be positive for local_gcn")
     if opt.max_solution_graph_solutions is not None and opt.max_solution_graph_solutions < 1:
         parser.error("--max_solution_graph_solutions must be positive")
     if opt.max_archive_solutions is not None and opt.max_archive_solutions < 1:
         parser.error("--max_archive_solutions must be positive")
     if opt.max_archive_rounds is not None and opt.max_archive_rounds < 1:
         parser.error("--max_archive_rounds must be positive")
+    if opt.probe_instances < 0 or opt.probe_repeats < 1:
+        parser.error("--probe_instances must be non-negative and --probe_repeats positive")
+    if opt.probe_instances and opt.refinement_mode != "local_gcn":
+        parser.error("--probe_instances requires --refinement_mode local_gcn")
     if (
         opt.max_solution_graph_solutions is not None
         and opt.max_archive_solutions is not None
@@ -650,7 +926,7 @@ if __name__ == "__main__":
         savepath=opt.output,
         graph_rounds=opt.graph_rounds,
         kl_weight=opt.kl_weight,
-        quality_prior_strength=opt.quality_prior_strength,
+        reinforce_weight=opt.reinforce_weight,
         train_pool_size=opt.train_pool_size,
         max_solution_graph_solutions=opt.max_solution_graph_solutions,
         max_archive_solutions=opt.max_archive_solutions,
@@ -660,4 +936,16 @@ if __name__ == "__main__":
         train_pool_mode=opt.train_pool_mode,
         pool_refresh_fraction=opt.pool_refresh_fraction,
         seed=opt.seed,
+        graph_structure=opt.graph_structure,
+        graph_layers=opt.graph_layers,
+        graph_quality_mode=opt.graph_quality_mode,
+        graph_quality_temperature=opt.graph_quality_temperature,
+        graph_diversity_strength=opt.graph_diversity_strength,
+        graph_candidate_only=opt.graph_candidate_only,
+        graph_supervision_weight=opt.graph_supervision_weight,
+        show_loss_values=opt.show_loss_values,
+        probe_instances=opt.probe_instances,
+        probe_repeats=opt.probe_repeats,
+        probe_seed=opt.probe_seed,
+        probe_output=opt.probe_output,
     )

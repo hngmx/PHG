@@ -1,4 +1,5 @@
 import unittest
+import inspect
 from contextlib import redirect_stdout
 from io import StringIO
 from types import SimpleNamespace
@@ -8,16 +9,24 @@ import torch
 
 import test as test_entrypoint
 import train as train_entrypoint
+from net import Net
 from solution_graph import InstanceSearchState
+from training_pool import PersistentTrainingInstance
 from utils import default_k_sparse, gen_pyg_data
 from train import (
     DEFAULT_GRAPH_ROUNDS,
+    DEFAULT_KL_WEIGHT,
+    DEFAULT_REINFORCE_WEIGHT,
     H0_VALIDATION_ITERATIONS,
     format_training_epoch,
+    format_training_losses,
     pool_refresh_fraction_for_mode,
+    reinforce_cost_loss,
+    resolve_loss_weights,
     resolve_training_profile,
     train_instance,
     validate_graph_rounds,
+    validate_loss_weights,
     validation_h0_only,
 )
 
@@ -25,6 +34,39 @@ from train import (
 class TrainingProfileTest(unittest.TestCase):
     def test_default_training_uses_one_heatmap_refinement(self):
         self.assertEqual(DEFAULT_GRAPH_ROUNDS, 1)
+
+    def test_test_entrypoints_default_to_deepaco_numba_sampling(self):
+        for function in (
+            test_entrypoint.infer_instance,
+            test_entrypoint.test,
+            test_entrypoint.main,
+        ):
+            self.assertEqual(
+                inspect.signature(function).parameters["sampling_backend"].default,
+                "numba",
+            )
+
+    def test_default_loss_weights_enable_reinforce_at_every_size(self):
+        self.assertEqual(DEFAULT_KL_WEIGHT, 0.03)
+        self.assertEqual(DEFAULT_REINFORCE_WEIGHT, 0.1)
+        self.assertEqual(resolve_loss_weights(50), (0.03, 0.1))
+        self.assertEqual(resolve_loss_weights(100), (0.03, 0.1))
+        self.assertEqual(resolve_loss_weights(200), (0.03, 0.1))
+        self.assertEqual(resolve_loss_weights(1000), (0.03, 0.1))
+        self.assertEqual(resolve_loss_weights(100, 0.03, 0.1), (0.03, 0.1))
+        self.assertEqual(resolve_loss_weights(100, reinforce_weight=0), (0.03, 0))
+        for function in (
+            train_instance, train_entrypoint.train_epoch,
+        ):
+            parameters = inspect.signature(function).parameters
+            self.assertEqual(parameters["kl_weight"].default, DEFAULT_KL_WEIGHT)
+            self.assertEqual(
+                parameters["reinforce_weight"].default,
+                DEFAULT_REINFORCE_WEIGHT,
+            )
+        train_parameters = inspect.signature(train_entrypoint.train).parameters
+        self.assertIsNone(train_parameters["kl_weight"].default)
+        self.assertIsNone(train_parameters["reinforce_weight"].default)
 
     def test_default_candidate_size_matches_original_deepaco(self):
         self.assertEqual(default_k_sparse(50), 5)
@@ -38,6 +80,81 @@ class TrainingProfileTest(unittest.TestCase):
             validate_graph_rounds(0)
         with self.assertRaises(ValueError):
             validate_graph_rounds(2)
+
+    def test_loss_weights_require_at_least_one_nonnegative_objective(self):
+        validate_loss_weights(1, 0)
+        validate_loss_weights(0, 1)
+        validate_loss_weights(1, 1)
+        for weights in ((0, 0), (-1, 1), (1, -1)):
+            with self.assertRaises(ValueError):
+                validate_loss_weights(*weights)
+
+    def test_reinforce_uses_leave_one_out_cost_baseline(self):
+        costs = torch.tensor([1.0, 3.0], requires_grad=True)
+        log_probs = torch.tensor([[-0.2, -0.7]], requires_grad=True)
+        loss = reinforce_cost_loss(costs, log_probs)
+        self.assertAlmostEqual(loss.item(), -0.5)
+        loss.backward()
+        self.assertTrue(torch.equal(log_probs.grad, torch.tensor([[-1.0, 1.0]])))
+        self.assertIsNone(costs.grad)
+
+    def test_reinforce_only_uses_live_h0_and_skips_graph_teacher(self):
+        calls = []
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.scale = torch.nn.Parameter(torch.tensor(0.3))
+
+            def forward(self, data):
+                return None
+
+            def reshape(self, data, values):
+                base = torch.tensor([[0.0, 1.0, 2.0], [1.0, 0.0, 2.0], [2.0, 1.0, 0.0]])
+                return torch.sigmoid(self.scale * base)
+
+            def refine_heatmap(self, *args, **kwargs):
+                raise AssertionError("REINFORCE-only must not construct H1")
+
+        class FakeInstance:
+            def materialize(self, k_sparse, device):
+                return None, torch.ones(3, 3)
+
+            def start_visit(self, *args, **kwargs):
+                raise AssertionError("REINFORCE-only must not create an archive")
+
+            def finish_visit(self):
+                calls.append("finish")
+
+        class FakeSampler:
+            def __init__(self, **kwargs):
+                self.heatmap = kwargs["heatmap"]
+                self.assert_live = self.heatmap.requires_grad
+
+            def sample(self, **kwargs):
+                calls.append(("sample", kwargs["require_log_probs"], self.assert_live))
+                return SimpleNamespace(
+                    sampled_costs=torch.tensor([1.0, 3.0]),
+                    log_probs=torch.stack((
+                        self.heatmap[0, 1].log(), self.heatmap[0, 2].log(),
+                    )).unsqueeze(0),
+                )
+
+        model = FakeModel()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        before = model.scale.item()
+        loss_stats = {"kl_sum": 0.0, "reinforce_sum": 0.0, "count": 0}
+        with patch.object(train_entrypoint, "device", "cpu", create=True):
+            train_instance(
+                model, optimizer, [FakeInstance()], n_ants=2, k_sparse=2,
+                kl_weight=0, reinforce_weight=1, sampler_factory=FakeSampler,
+                loss_stats=loss_stats,
+            )
+        self.assertEqual(calls, [("sample", True, True), "finish"])
+        self.assertNotEqual(model.scale.item(), before)
+        self.assertEqual(loss_stats["count"], 1)
+        self.assertEqual(loss_stats["kl_sum"], 0.0)
+        self.assertTrue(torch.isfinite(loss_stats["reinforce_sum"]))
 
     def test_training_samples_s0_once_and_optimizes_only_distillation(self):
         calls = []
@@ -69,7 +186,6 @@ class TrainingProfileTest(unittest.TestCase):
                 self.assert_no_grad = not torch.is_grad_enabled()
                 self.archive_size = len(archive)
                 self.refinement_prior = prior.detach().clone()
-                self.prior_strength = kwargs["prior_strength"]
                 teacher = torch.tensor([
                     [0.0, 0.7, 0.2, 0.1],
                     [0.7, 0.0, 0.2, 0.1],
@@ -109,10 +225,14 @@ class TrainingProfileTest(unittest.TestCase):
         instance = FakeInstance()
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
         initial_scale = model.scale.item()
+        loss_stats = {"kl_sum": 0.0, "reinforce_sum": 0.0, "count": 0}
         with patch.object(train_entrypoint, "device", "cpu", create=True):
             train_instance(
                 model, optimizer, [instance], n_ants=2, k_sparse=2,
+                kl_weight=1, reinforce_weight=0,
+                refinement_mode="deterministic",
                 sampler_factory=FakeSampler,
+                loss_stats=loss_stats,
             )
 
         self.assertEqual(calls, ["create", "sample", "refine"])
@@ -122,13 +242,57 @@ class TrainingProfileTest(unittest.TestCase):
         self.assertTrue(torch.equal(
             model.refinement_prior, instance.state.initial_heatmap
         ))
-        self.assertEqual(model.prior_strength, 0.1)
         self.assertEqual(instance.state.round_index, 0)
         self.assertTrue(torch.equal(
             instance.state.current_heatmap, instance.state.initial_heatmap
         ))
         self.assertEqual(instance.visits, 1)
         self.assertNotEqual(model.scale.item(), initial_scale)
+        self.assertEqual(loss_stats["count"], 1)
+        self.assertGreater(loss_stats["kl_sum"].item(), 0)
+        self.assertEqual(loss_stats["reinforce_sum"], 0.0)
+
+    def test_local_gcn_training_updates_teacher_and_h0(self):
+        class FakeSampler:
+            def __init__(self, **kwargs):
+                pass
+
+            def sample(self, **kwargs):
+                return SimpleNamespace(
+                    feasible_paths=torch.tensor([
+                        [0, 0], [1, 2], [2, 4], [3, 1], [4, 3],
+                    ]),
+                    feasible_costs=torch.tensor([5.0, 6.0]),
+                )
+
+        instance = PersistentTrainingInstance(torch.tensor([
+            [0.0, 0.0], [0.2, 0.9], [0.7, 0.1],
+            [0.9, 0.9], [0.5, 0.5],
+        ]))
+        model = Net(local_gcn_hidden=8)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+        before_h0 = model.par_net_heu.lins[-1].weight.detach().clone()
+        before_gcn = model.local_edge_gcn.output.weight.detach().clone()
+        stats = {
+            "kl_sum": 0.0, "reinforce_sum": 0.0,
+            "graph_sum": 0.0, "count": 0,
+        }
+        with patch.object(train_entrypoint, "device", "cpu", create=True):
+            train_instance(
+                model, optimizer, [instance], n_ants=2, k_sparse=2,
+                kl_weight=1.0, reinforce_weight=0.0,
+                sampler_factory=FakeSampler, loss_stats=stats,
+            )
+        self.assertEqual(instance.visits, 1)
+        self.assertEqual(stats["count"], 1)
+        self.assertGreater(float(stats["graph_sum"]), 0)
+        self.assertGreater(float(stats["kl_sum"]), 0)
+        self.assertFalse(torch.equal(
+            model.local_edge_gcn.output.weight.detach(), before_gcn,
+        ))
+        self.assertFalse(torch.equal(
+            model.par_net_heu.lins[-1].weight.detach(), before_h0,
+        ))
 
     def test_h0_checkpoint_validation_uses_test_inference_path(self):
         with patch(
@@ -140,7 +304,7 @@ class TrainingProfileTest(unittest.TestCase):
             )
         self.assertEqual(curve, [7.0, 6.0])
         self.assertEqual(infer.call_count, 2)
-        self.assertEqual(infer.call_args.kwargs["sampling_backend"], "torch")
+        self.assertEqual(infer.call_args.kwargs["sampling_backend"], "numba")
         self.assertEqual(H0_VALIDATION_ITERATIONS, 10)
 
     def test_training_epoch_display_keeps_four_value_style(self):
@@ -151,6 +315,45 @@ class TrainingProfileTest(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             format_training_epoch(2, metrics[:3])
+
+    def test_optional_loss_display_reports_raw_and_weighted_means(self):
+        values = {"kl": 0.25, "reinforce": -0.5}
+        self.assertEqual(
+            format_training_losses(2, values, 0.03, 0.1),
+            "epoch 2 losses: KL=0.25 (weighted=0.0075), "
+            "REINFORCE=-0.5 (weighted=-0.05)",
+        )
+        self.assertFalse(
+            inspect.signature(train_entrypoint.train).parameters[
+                "show_loss_values"
+            ].default
+        )
+
+    def test_loss_collection_is_optional_and_averaged_over_instances(self):
+        batches = [[object(), object()], [object()]]
+        seen_collectors = []
+
+        def fake_train_instance(_model, _optimizer, batch, *_args, loss_stats=None, **_kwargs):
+            seen_collectors.append(loss_stats)
+            if loss_stats is not None:
+                for _ in batch:
+                    loss_stats["kl_sum"] += torch.tensor(2.0)
+                    loss_stats["reinforce_sum"] += torch.tensor(-1.0)
+                    loss_stats["count"] += 1
+
+        with patch("train.iter_pool_batches", return_value=batches), patch(
+            "train.train_instance", side_effect=fake_train_instance,
+        ):
+            self.assertIsNone(train_entrypoint.train_epoch(
+                2, 2, 2, None, None, None,
+            ))
+            self.assertTrue(all(collector is None for collector in seen_collectors))
+            seen_collectors.clear()
+            values = train_entrypoint.train_epoch(
+                2, 2, 2, None, None, None, collect_loss_values=True,
+            )
+        self.assertEqual(values, {"kl": 2.0, "reinforce": -1.0, "graph": 0.0})
+        self.assertIs(seen_collectors[0], seen_collectors[1])
 
     def test_training_validation_keeps_h0_t10_checkpoint_curve(self):
         results = [
@@ -207,6 +410,7 @@ class TrainingProfileTest(unittest.TestCase):
 
     def test_test_entrypoint_samples_only_s0(self):
         calls = []
+        inference_modes = []
 
         class FakeModel:
             def eval(self):
@@ -228,6 +432,7 @@ class TrainingProfileTest(unittest.TestCase):
 
             def sample(self, **kwargs):
                 calls.append("sample")
+                inference_modes.append(kwargs["inference"])
                 self.best_cost -= 1.0
 
         costs = test_entrypoint.infer_instance(
@@ -237,6 +442,7 @@ class TrainingProfileTest(unittest.TestCase):
         )
 
         self.assertEqual(calls, ["eval", "create", "sample", "sample", "sample"])
+        self.assertEqual(inference_modes, [True, True, True])
         self.assertEqual(costs, [9.0, 8.0, 7.0])
 
     def test_test_aggregates_without_printing_each_instance(self):

@@ -57,6 +57,11 @@ class ACOSolutionSampler:
     def best_cost(self):
         return self._aco.lowest_cost
 
+    @property
+    def pheromone(self):
+        """Current ACO pheromone, after the latest sampling/update step."""
+        return self._aco.pheromone
+
     def set_heatmap(self, heatmap):
         self._aco.set_heuristic(heatmap)
 

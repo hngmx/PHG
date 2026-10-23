@@ -1,17 +1,10 @@
-"""Cumulative solution-hypergraph utilities for dynamic DeepACO heatmaps.
+"""Persistent tour archive and solution-edge graphs for H0-to-H1 training.
 
-The graph requested by the solution-graph variant has one node for every TSP
-edge observed in the sampled tours.  The graph relation between two edge nodes
-is the set of sampled solutions containing both edges.  Materialising that
-clique graph costs O(num_solutions * n_nodes**2), so this module stores the
-equivalent hypergraph incidence representation instead:
-
-    edge node <-> sampled solution (hyperedge)
-
-Two edge nodes are related exactly when they share at least one solution
-hyperedge. ``SolutionArchive`` retains every sampled feasible solution across
-visits to the same training instance, including repeated tours. Optional caps
-can prune older rounds or lower-ranked observations.
+The default local graph retains strong candidate and sampled city edges as
+nodes. Compatible edge pairs sharing a city are relations, with observed tour
+fragments supplying quality-weighted evidence. Older whole-tour hypergraph
+helpers remain for checkpoint and ablation compatibility. ``SolutionArchive``
+retains feasible sampled tours across visits to the same training instance.
 """
 
 from __future__ import annotations
@@ -600,7 +593,6 @@ def quality_target_heatmap(
     age_decay=0.1,
     uniform_mix=0.01,
     elite_ratio=0.25,
-    prior_strength=0.5,
     propagation_strength=0.1,
     distance_prior_strength=0.1,
 ):
@@ -609,12 +601,11 @@ def quality_target_heatmap(
     Direct edge support is first aggregated from all solution hyperedges.  A
     second edge->solution->edge pass propagates context between TSP edges that
     occur in the same archived solutions.  Direct support, propagated support,
-    inverse-distance support, and the preceding heatmap are normalized before
-    convex mixing.  This function has no trainable parameters, so its output
-    can safely serve as a detached KL pseudo-label.
+    inverse-distance support are normalized before convex mixing. The
+    preceding heatmap supplies only shape, device, and dtype; its values are
+    not mixed into the result. This function has no trainable parameters, so
+    its output can safely serve as a detached KL pseudo-label.
     """
-    if not 0 <= prior_strength <= 1:
-        raise ValueError("quality prior strength must be between 0 and 1")
     if not 0 <= propagation_strength <= 1:
         raise ValueError("propagation strength must be between 0 and 1")
     if not 0 <= distance_prior_strength <= 1:
@@ -670,35 +661,46 @@ def quality_target_heatmap(
             + distance_prior_strength * distance_target
         )
 
-    previous = normalize_rows(previous_heatmap)
-    refined = (1.0 - prior_strength) * graph_target + prior_strength * previous
-    return normalize_rows(refined) + EPS * mask
+    return normalize_rows(graph_target) + EPS * mask
 
 
 def graph_refined_heatmap(
     fresh_h0_heatmap,
     archive: SolutionArchive,
-    prior_strength=0.1,
     layers=2,
+    structure="whole_tour",
+    quality_mode="inverse_cost",
+    quality_temperature=0.1,
+    candidate_only=False,
 ):
-    """Two-layer, parameter-free weighted GCN on the archived edge graph.
+    """Parameter-free weighted GCN on the archived edge graph.
 
-    A graph node represents an undirected TSP edge. Its initial scalar feature
-    is the mean of 1 / tour_cost over all archived tour occurrences containing it.
-    Two graph nodes have co-occurrence weight
-    ``A[e, f] = sum_{tour contains e,f} 1 / tour_cost``. The incidence form
-    computes symmetric-normalized GCN messages without materializing cliques.
+    A graph node represents an undirected TSP edge. In ``inverse_cost`` mode,
+    its initial scalar feature is the mean of 1 / tour_cost over all archived
+    tour occurrences containing it.
+    ``whole_tour`` relates all edges in a tour, as in the original teacher.
+    ``local`` relates only consecutive tour edges and gives each edge a
+    self-loop. Both use symmetric-normalized messages without dense cliques.
+    ``relative`` quality mode uses cost-relative route weights and a
+    quality-weighted edge occurrence frequency. It does not decay old visits.
+    ``candidate_only`` builds graph nodes only for edges present in H0's
+    candidate support and masks the directed output to that same support.
     Historical tours have exactly the same statistical role as new tours: no
-    age or round decay is applied.
+    age or round decay is applied. The returned H1 contains only the graph
+    result; fresh H0 values are never blended into it.
     """
     if fresh_h0_heatmap.dim() != 2 or (
         fresh_h0_heatmap.size(0) != fresh_h0_heatmap.size(1)
     ):
         raise ValueError("fresh H0 heatmap must be square")
-    if not 0 <= prior_strength <= 1:
-        raise ValueError("prior strength must be between 0 and 1")
     if layers < 1:
         raise ValueError("GCN layers must be positive")
+    if structure not in {"whole_tour", "local"}:
+        raise ValueError("unknown solution-edge graph structure")
+    if quality_mode not in {"inverse_cost", "relative"}:
+        raise ValueError("unknown solution quality mode")
+    if quality_temperature <= 0:
+        raise ValueError("quality temperature must be positive")
     if len(archive) == 0:
         raise ValueError("the edge graph needs at least one sampled solution")
 
@@ -711,47 +713,117 @@ def graph_refined_heatmap(
         device=fresh_h0_heatmap.device,
         dtype=fresh_h0_heatmap.dtype,
     )
-    inverse_costs = costs.clamp_min(EPS).reciprocal()
+    if quality_mode == "inverse_cost":
+        solution_weights = costs.clamp_min(EPS).reciprocal()
+    else:
+        scale = (costs.mean() * quality_temperature).clamp_min(EPS)
+        solution_weights = torch.exp(
+            -(costs - costs.min()) / scale
+        ).clamp_min(EPS)
     n_solutions = paths.size(0)
     next_nodes = torch.roll(paths, shifts=-1, dims=1)
     edge_u = torch.minimum(paths, next_nodes)
     edge_v = torch.maximum(paths, next_nodes)
     edge_keys = (edge_u * n_nodes + edge_v).reshape(-1)
+    candidate = fresh_h0_heatmap.detach() > (10.0 * EPS)
+    if candidate_only:
+        keep = (candidate | candidate.T)[edge_u, edge_v].reshape(-1)
+        if not bool(keep.any()):
+            raise ValueError(
+                "candidate-only graph has no observed candidate-edge support"
+            )
+        edge_keys = edge_keys[keep]
     unique_keys, edge_incidence = torch.unique(
         edge_keys, sorted=True, return_inverse=True
     )
     solution_incidence = torch.arange(
         n_solutions, device=paths.device
     ).repeat_interleave(n_nodes)
-    incidence_inverse_cost = inverse_costs.index_select(
+    if candidate_only:
+        solution_incidence = solution_incidence[keep]
+    incidence_weights = solution_weights.index_select(
         0, solution_incidence
     )
     n_edges = unique_keys.numel()
-    support_sum = inverse_costs.new_zeros(n_edges)
-    support_sum.index_add_(0, edge_incidence, incidence_inverse_cost)
-    counts = inverse_costs.new_zeros(n_edges)
-    counts.index_add_(0, edge_incidence, torch.ones_like(incidence_inverse_cost))
-    initial = support_sum / counts.clamp_min(1.0)
+    support_sum = solution_weights.new_zeros(n_edges)
+    support_sum.index_add_(0, edge_incidence, incidence_weights)
+    if quality_mode == "inverse_cost":
+        counts = solution_weights.new_zeros(n_edges)
+        counts.index_add_(0, edge_incidence, torch.ones_like(incidence_weights))
+        initial = support_sum / counts.clamp_min(1.0)
+    else:
+        initial = support_sum / solution_weights.sum().clamp_min(EPS)
 
-    # The weighted co-occurrence graph is A = B diag(1/cost) B^T, including
-    # self-loops. Every tour has n_nodes edges, so D[e] = n_nodes * support[e].
-    degree_sqrt = (n_nodes * support_sum).clamp_min(EPS).sqrt()
+    # In the whole-tour graph, every tour contributes an n_nodes-edge clique.
+    # In the local graph, each occurrence contributes two consecutive-neighbor
+    # relations and one self-loop, so both degrees have a closed form.
+    if candidate_only:
+        if structure == "whole_tour":
+            retained_per_solution = torch.bincount(
+                solution_incidence, minlength=n_solutions,
+            ).to(dtype=solution_weights.dtype)
+            degree = support_sum.new_zeros(n_edges)
+            degree.index_add_(
+                0, edge_incidence,
+                incidence_weights * retained_per_solution.index_select(
+                    0, solution_incidence,
+                ),
+            )
+        else:
+            occurrence_edges = torch.full(
+                (n_solutions * n_nodes,), -1,
+                device=paths.device, dtype=torch.long,
+            )
+            occurrence_edges[keep] = edge_incidence
+            neighbors = torch.roll(
+                occurrence_edges.reshape(n_solutions, n_nodes),
+                shifts=-1, dims=1,
+            ).reshape(-1)
+            valid_pair = (occurrence_edges >= 0) & (neighbors >= 0)
+            local_source = occurrence_edges[valid_pair]
+            local_neighbor = neighbors[valid_pair]
+            pair_weights = solution_weights.repeat_interleave(n_nodes)[valid_pair]
+            degree = support_sum.clone()
+            degree.index_add_(0, local_source, pair_weights)
+            degree.index_add_(0, local_neighbor, pair_weights)
+    else:
+        degree_multiplier = n_nodes if structure == "whole_tour" else 3
+        degree = degree_multiplier * support_sum
+    degree_sqrt = degree.clamp_min(EPS).sqrt()
+    if structure == "local" and not candidate_only:
+        local_source = edge_incidence
+        local_neighbor = torch.roll(
+            edge_incidence.reshape(n_solutions, n_nodes), shifts=-1, dims=1,
+        ).reshape(-1)
     hidden = initial
     for _ in range(layers):
         normalized_edges = hidden / degree_sqrt
-        solution_messages = hidden.new_zeros(n_solutions)
-        solution_messages.index_add_(
-            0,
-            solution_incidence,
-            normalized_edges.index_select(0, edge_incidence),
-        )
-        edge_messages = hidden.new_zeros(n_edges)
-        edge_messages.index_add_(
-            0,
-            edge_incidence,
-            incidence_inverse_cost
-            * solution_messages.index_select(0, solution_incidence),
-        )
+        if structure == "whole_tour":
+            solution_messages = hidden.new_zeros(n_solutions)
+            solution_messages.index_add_(
+                0,
+                solution_incidence,
+                normalized_edges.index_select(0, edge_incidence),
+            )
+            edge_messages = hidden.new_zeros(n_edges)
+            edge_messages.index_add_(
+                0,
+                edge_incidence,
+                incidence_weights
+                * solution_messages.index_select(0, solution_incidence),
+            )
+        else:
+            edge_messages = support_sum * normalized_edges
+            edge_messages.index_add_(
+                0, local_source,
+                (pair_weights if candidate_only else incidence_weights)
+                * normalized_edges.index_select(0, local_neighbor),
+            )
+            edge_messages.index_add_(
+                0, local_neighbor,
+                (pair_weights if candidate_only else incidence_weights)
+                * normalized_edges.index_select(0, local_source),
+            )
         hidden = 0.5 * hidden + 0.5 * (edge_messages / degree_sqrt)
 
     output_u = torch.div(unique_keys, n_nodes, rounding_mode="floor")
@@ -759,11 +831,301 @@ def graph_refined_heatmap(
     graph_heatmap = hidden.new_zeros((n_nodes, n_nodes))
     graph_heatmap[output_u, output_v] = hidden
     graph_heatmap[output_v, output_u] = hidden
+    if candidate_only:
+        graph_heatmap = graph_heatmap.masked_fill(~candidate, 0.0)
     graph_heatmap = normalize_heatmap_rows(graph_heatmap)
-    prior = normalize_heatmap_rows(fresh_h0_heatmap.detach())
-    return normalize_heatmap_rows(
-        (1.0 - prior_strength) * graph_heatmap + prior_strength * prior
+    return graph_heatmap
+
+
+def build_local_edge_gcn_graph(
+    heatmap,
+    distances,
+    archive: SolutionArchive,
+    max_solutions=None,
+    quality_mode="relative_diversity",
+    quality_temperature=0.1,
+    diversity_strength=0.5,
+    candidate_only=False,
+    pheromone=None,
+    incident_topk=6,
+):
+    """Build a sparse edge-node graph with compatible TSP fragments.
+
+    Each city keeps its strongest ``incident_topk`` edges after merging
+    pheromone/heuristic candidates with quality-weighted sampled edges.  Every
+    pair of retained edges sharing a city is a relation; observed consecutive
+    tour fragments add evidence to that relation, while unseen compatible
+    fragments keep zero evidence and a small nonzero message-passing weight.
+    """
+    if heatmap.ndim != 2 or heatmap.size(0) != heatmap.size(1):
+        raise ValueError("H0 heatmap must be square")
+    if distances.shape != heatmap.shape:
+        raise ValueError("distance matrix shape must match the heatmap")
+    if max_solutions is not None and max_solutions < 1:
+        raise ValueError("maximum solution-graph size must be positive")
+    if quality_mode not in {"inverse_cost", "relative", "relative_diversity"}:
+        raise ValueError("unknown solution quality mode")
+    if quality_temperature <= 0:
+        raise ValueError("quality temperature must be positive")
+    if not 0 <= diversity_strength <= 1:
+        raise ValueError("diversity strength must be between 0 and 1")
+    if incident_topk < 1:
+        raise ValueError("incident top-k must be positive")
+    if pheromone is not None and pheromone.shape != heatmap.shape:
+        raise ValueError("pheromone shape must match the heatmap")
+
+    paths, costs, _ = archive.tensors(device=heatmap.device)
+    paths = paths.to(dtype=torch.long)
+    costs = costs.to(dtype=heatmap.dtype)
+    n_solutions, n_nodes = paths.shape
+    if n_nodes != heatmap.size(0):
+        raise ValueError("archive and heatmap node counts must match")
+    if max_solutions is not None and n_solutions > max_solutions:
+        selected = torch.topk(costs, k=max_solutions, largest=False).indices
+        paths = paths.index_select(0, selected)
+        costs = costs.index_select(0, selected)
+        n_solutions = paths.size(0)
+
+    next_city = torch.roll(paths, shifts=-1, dims=1)
+    lo = torch.minimum(paths, next_city)
+    hi = torch.maximum(paths, next_city)
+    keys = (lo * n_nodes + hi).reshape(-1)
+    if quality_mode == "inverse_cost":
+        weights = costs.clamp_min(EPS).reciprocal()
+    else:
+        scale = (costs.mean() * quality_temperature).clamp_min(EPS)
+        weights = torch.exp(-(costs - costs.min()) / scale).clamp_min(EPS)
+    novelty = torch.ones_like(weights)
+    if quality_mode == "relative_diversity" and diversity_strength > 0:
+        # Count undirected tour-edge occurrences across the archive. A tour
+        # dominated by repeated edges contributes less than one with rarer
+        # edges, without discarding any feasible solution from the archive.
+        _, all_edge_ids, all_edge_counts = torch.unique(
+            keys, sorted=True, return_inverse=True, return_counts=True,
+        )
+        edge_rarity = all_edge_counts[all_edge_ids].to(weights.dtype).rsqrt()
+        route_rarity = edge_rarity.reshape(n_solutions, n_nodes).mean(dim=1)
+        relative_rarity = route_rarity / route_rarity.mean().clamp_min(EPS)
+        novelty = (
+            1.0 + diversity_strength * (relative_rarity - 1.0)
+        ).clamp(0.5, 1.5)
+        weights = weights * novelty
+    occurrence_weights = weights[:, None].expand(-1, n_nodes).reshape(-1)
+    observed_keys, observed_ids = torch.unique(
+        keys, sorted=True, return_inverse=True,
     )
+    observed_support = weights.new_zeros(observed_keys.numel())
+    observed_support.index_add_(0, observed_ids, occurrence_weights)
+    observed_counts = weights.new_zeros(observed_keys.numel())
+    observed_counts.index_add_(0, observed_ids, torch.ones_like(occurrence_weights))
+
+    candidate = (heatmap.detach() > 10.0 * EPS)
+    candidate = candidate | candidate.T
+    candidate.fill_diagonal_(False)
+    q = heatmap.detach().clamp_min(0)
+    if pheromone is not None:
+        q = q * pheromone.detach().to(device=q.device, dtype=q.dtype).clamp_min(0)
+    q = torch.maximum(q, q.T).masked_fill(~candidate, 0.0)
+    topk = min(incident_topk, n_nodes - 1)
+    candidate_values, candidate_neighbors = torch.topk(
+        q.masked_fill(~candidate, -torch.inf), k=topk, dim=-1,
+    )
+    candidate_cities = torch.arange(n_nodes, device=paths.device)[:, None].expand_as(
+        candidate_neighbors
+    )
+    candidate_valid = torch.isfinite(candidate_values)
+    candidate_lo = torch.minimum(candidate_cities, candidate_neighbors)
+    candidate_hi = torch.maximum(candidate_cities, candidate_neighbors)
+    candidate_keys = (
+        candidate_lo * n_nodes + candidate_hi
+    )[candidate_valid]
+    observed_allowed = (
+        candidate[torch.div(observed_keys, n_nodes, rounding_mode="floor"),
+                  observed_keys.remainder(n_nodes)]
+        if candidate_only else torch.ones_like(observed_keys, dtype=torch.bool)
+    )
+    merged_keys = torch.unique(
+        torch.cat((candidate_keys, observed_keys[observed_allowed])), sorted=True,
+    )
+    if merged_keys.numel() == 0:
+        raise ValueError("local edge graph has no candidate or sampled edges")
+    observed_positions = torch.searchsorted(observed_keys, merged_keys)
+    observed_positions = observed_positions.clamp_max(observed_keys.numel() - 1)
+    merged_observed = observed_keys[observed_positions] == merged_keys
+    merged_support = torch.where(
+        merged_observed, observed_support[observed_positions],
+        torch.zeros_like(merged_keys, dtype=weights.dtype),
+    )
+    merged_u = torch.div(merged_keys, n_nodes, rounding_mode="floor")
+    merged_v = merged_keys.remainder(n_nodes)
+    # Normalizing by the population weight makes sampled support comparable to
+    # the heuristic/pheromone candidate score during top-D selection.
+    merged_scores = q[merged_u, merged_v] + merged_support / weights.sum().clamp_min(EPS)
+    incident_scores = q.new_full((n_nodes, n_nodes), -torch.inf)
+    incident_scores[merged_u, merged_v] = merged_scores
+    incident_scores[merged_v, merged_u] = merged_scores
+    retained_values, retained_neighbors = torch.topk(
+        incident_scores, k=topk, dim=-1,
+    )
+    retained_cities = torch.arange(n_nodes, device=paths.device)[:, None].expand_as(
+        retained_neighbors
+    )
+    retained = torch.isfinite(retained_values)
+    retained_lo = torch.minimum(retained_cities, retained_neighbors)
+    retained_hi = torch.maximum(retained_cities, retained_neighbors)
+    unique_keys = torch.unique(
+        (retained_lo * n_nodes + retained_hi)[retained], sorted=True,
+    )
+    n_edges = unique_keys.numel()
+    selected_positions = torch.searchsorted(observed_keys, unique_keys)
+    selected_positions = selected_positions.clamp_max(observed_keys.numel() - 1)
+    selected_observed = observed_keys[selected_positions] == unique_keys
+    support = torch.where(
+        selected_observed, observed_support[selected_positions],
+        torch.zeros(n_edges, device=weights.device, dtype=weights.dtype),
+    )
+    counts = torch.where(
+        selected_observed, observed_counts[selected_positions],
+        torch.zeros(n_edges, device=weights.device, dtype=weights.dtype),
+    )
+    edge_u = torch.div(unique_keys, n_nodes, rounding_mode="floor")
+    edge_v = unique_keys.remainder(n_nodes)
+    inverse_distance = distances.detach()[edge_u, edge_v].clamp_min(EPS).reciprocal()
+    inverse_distance = inverse_distance / inverse_distance.max().clamp_min(EPS)
+    # Candidate-only nodes still need a positive starting score in H1.
+    edge_prior = support + 0.01 * weights.mean() * inverse_distance
+    edge_features = torch.stack((
+        support / support.max().clamp_min(EPS),
+        counts / n_solutions,
+        inverse_distance,
+    ), dim=-1)
+
+    # Enumerate only local, compatible edge pairs: O(sum_v degree(v)^2), not
+    # the dense O(n_edges^2) graph. All pairs receive a relation, regardless
+    # of whether that fragment has yet appeared in an archived tour.
+    incident = [[] for _ in range(n_nodes)]
+    for edge_id, (u, v) in enumerate(zip(edge_u.tolist(), edge_v.tolist())):
+        incident[u].append(edge_id)
+        incident[v].append(edge_id)
+    pair_keys_list = []
+    shared_list = []
+    for city, edge_ids_at_city in enumerate(incident):
+        for i, source in enumerate(edge_ids_at_city):
+            for target in edge_ids_at_city[i + 1:]:
+                pair_keys_list.append(source * n_edges + target)
+                shared_list.append(city)
+    pair_keys = torch.tensor(pair_keys_list, device=paths.device, dtype=torch.long)
+    shared_city = torch.tensor(shared_list, device=paths.device, dtype=torch.long)
+    order = torch.argsort(pair_keys)
+    pair_keys = pair_keys[order]
+    shared_city = shared_city[order]
+    pair_source = torch.div(pair_keys, n_edges, rounding_mode="floor")
+    pair_target = pair_keys.remainder(n_edges)
+
+    selected_at_occurrence = torch.searchsorted(unique_keys, keys)
+    selected_at_occurrence = selected_at_occurrence.clamp_max(n_edges - 1)
+    valid_occurrence = (unique_keys[selected_at_occurrence] == keys).reshape(
+        n_solutions, n_nodes
+    )
+    occurrence = selected_at_occurrence.reshape(n_solutions, n_nodes)
+    next_occurrence = torch.roll(occurrence, shifts=-1, dims=1)
+    valid_fragments = valid_occurrence & torch.roll(
+        valid_occurrence, shifts=-1, dims=1
+    )
+    fragment_source = torch.minimum(occurrence, next_occurrence)[valid_fragments]
+    fragment_target = torch.maximum(occurrence, next_occurrence)[valid_fragments]
+    fragment_keys = fragment_source * n_edges + fragment_target
+    fragment_position = torch.searchsorted(pair_keys, fragment_keys)
+    fragment_position = fragment_position.clamp_max(pair_keys.numel() - 1)
+    if not bool((pair_keys[fragment_position] == fragment_keys).all()):
+        raise RuntimeError("sampled tour contains an incompatible edge fragment")
+    fragment_weights = weights[:, None].expand(-1, n_nodes)[valid_fragments]
+    fragment_best = (costs == costs.min())[:, None].expand(-1, n_nodes)[valid_fragments]
+    fragment_count = weights.new_zeros(pair_keys.numel())
+    fragment_count.index_add_(0, fragment_position, torch.ones_like(fragment_weights))
+    fragment_support = weights.new_zeros(pair_keys.numel())
+    fragment_support.index_add_(0, fragment_position, fragment_weights)
+    fragment_max = weights.new_zeros(pair_keys.numel())
+    fragment_max.scatter_reduce_(
+        0, fragment_position, fragment_weights, reduce="amax", include_self=True,
+    )
+    fragment_best_count = weights.new_zeros(pair_keys.numel())
+    fragment_best_count.index_add_(
+        0, fragment_position, fragment_best.to(weights.dtype),
+    )
+    shared_length_a = distances.detach()[edge_u[pair_source], edge_v[pair_source]]
+    shared_length_b = distances.detach()[edge_u[pair_target], edge_v[pair_target]]
+    outer_a = torch.where(
+        edge_u[pair_source] == shared_city, edge_v[pair_source], edge_u[pair_source],
+    )
+    outer_b = torch.where(
+        edge_u[pair_target] == shared_city, edge_v[pair_target], edge_u[pair_target],
+    )
+    outer_length = distances.detach()[outer_a, outer_b]
+    length_ratio = (
+        torch.minimum(shared_length_a, shared_length_b)
+        / torch.maximum(shared_length_a, shared_length_b).clamp_min(EPS)
+    )
+    angle_cosine = (
+        (shared_length_a.square() + shared_length_b.square() - outer_length.square())
+        / (2 * shared_length_a * shared_length_b).clamp_min(EPS)
+    ).clamp(-1.0, 1.0)
+    relation_features = torch.stack((
+        fragment_count / n_solutions,
+        fragment_support / weights.sum().clamp_min(EPS),
+        fragment_support / weights.sum().clamp_min(EPS) / fragment_count.clamp_min(1),
+        fragment_max / weights.sum().clamp_min(EPS),
+        (fragment_best_count > 0).to(weights.dtype),
+        length_ratio,
+        angle_cosine,
+    ), dim=-1)
+    # Nonobserved compatible relations remain traversable by the GCN.
+    relation_weight = 0.05 + (
+        fragment_support / weights.mean().clamp_min(EPS)
+        * (n_nodes / (2.0 * n_solutions))
+    )
+    edge_index = torch.stack((
+        torch.cat((pair_source, pair_target)),
+        torch.cat((pair_target, pair_source)),
+    ))
+    edge_weight = torch.cat((relation_weight, relation_weight))
+    relation_features = torch.cat((relation_features, relation_features), dim=0)
+
+    # Best quartile supplies a quality target distinct from all-tour support.
+    elite_count = max(1, (n_solutions + 3) // 4)
+    elite = torch.zeros(n_solutions, device=paths.device, dtype=torch.bool)
+    elite[torch.topk(costs, k=elite_count, largest=False).indices] = True
+    elite_occurrences = elite.repeat_interleave(n_nodes)
+    selected_elite_occurrences = valid_occurrence.reshape(-1) & elite_occurrences
+    target_support = weights.new_zeros(n_edges)
+    target_support.index_add_(
+        0, selected_at_occurrence[selected_elite_occurrences],
+        occurrence_weights[selected_elite_occurrences],
+    )
+    target_support = target_support + 0.01 * edge_prior
+    quality_target = weights.new_zeros((n_nodes, n_nodes))
+    quality_target[edge_u, edge_v] = target_support
+    quality_target[edge_v, edge_u] = target_support
+    if candidate_only:
+        quality_target = quality_target.masked_fill(~candidate, 0.0)
+        if not bool((quality_target.sum(dim=-1) > 0).all()):
+            raise ValueError("candidate-only local graph leaves a city without support")
+
+    return {
+        "edge_features": edge_features,
+        "edge_index": edge_index,
+        "edge_weight": edge_weight,
+        "relation_features": relation_features,
+        "edge_prior": edge_prior,
+        "solution_weights": weights,
+        "solution_novelty": novelty,
+        "edge_u": edge_u,
+        "edge_v": edge_v,
+        "candidate": candidate if candidate_only else None,
+        "quality_target": normalize_heatmap_rows(quality_target),
+        "n_nodes": n_nodes,
+        "n_solutions": n_solutions,
+    }
 
 
 def rowwise_heatmap_kl(student_heatmap, target_heatmap, support_mask=None):

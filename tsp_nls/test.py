@@ -9,8 +9,8 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from aco import ACO
 from net import Net
-from solution_sampler import ACOSolutionSampler
 from utils import default_k_sparse, load_test_dataset
 
 
@@ -39,41 +39,60 @@ def infer_instance(
     n_ants,
     n_iterations=10,
     local_search=None,
-    sampling_backend="torch",
-    sampler_factory=ACOSolutionSampler,
+    sampling_backend="numba",
+    sampler_factory=None,
     return_training_metrics=False,
 ):
-    """Run ACO on one H0; optionally report DeepACO-style training metrics."""
+    """Run the original DeepACO ACO search on one H0."""
     if n_iterations < 1:
         raise ValueError("n_iterations must be positive")
     if return_training_metrics and n_iterations < 5:
         raise ValueError("DeepACO training metrics require at least 5 ACO iterations")
     model.eval()
     heatmap = (model.reshape(pyg_data, model(pyg_data)) + EPS).cpu()
-    sampler = sampler_factory(
-        n_solutions=n_ants,
-        heatmap=heatmap,
-        distances=distances.cpu(),
-        device="cpu",
-        local_search=local_search,
-    )
+    if sampler_factory is None:
+        aco = ACO(
+            n_ants=n_ants,
+            heuristic=heatmap,
+            distances=distances.cpu(),
+            device="cpu",
+            local_search=local_search,
+        )
+    else:
+        # Allow controlled sampler substitutes for experiments and unit tests.
+        sampler = sampler_factory(
+            n_solutions=n_ants,
+            heatmap=heatmap,
+            distances=distances.cpu(),
+            device="cpu",
+            local_search=local_search,
+        )
     best_costs = []
     training_metrics = []
     if return_training_metrics:
         # The original DeepACO validation first probes the sampler without
         # changing pheromone or the cumulative best, then runs ACO for 1+4
         # iterations. Keep the checkpoint curve at 10 actual ACO iterations.
-        probe_costs = sampler.probe(inference=sampling_backend == "numba")
+        if sampler_factory is None:
+            probe_costs = aco.sample(
+                inference=sampling_backend == "numba", require_prob=False,
+            )[0]
+        else:
+            probe_costs = sampler.probe(inference=sampling_backend == "numba")
         training_metrics.extend((float(probe_costs.mean()), float(probe_costs.min())))
     for iteration in range(n_iterations):
-        sampler.sample(
-            inference=sampling_backend == "numba",
-            require_log_probs=False,
-            local_search_inference=False if local_search is not None else None,
-        )
-        best_costs.append(float(sampler.best_cost))
+        if sampler_factory is None:
+            best_cost = aco.run(1, inference=sampling_backend == "numba")
+        else:
+            sampler.sample(
+                inference=sampling_backend == "numba",
+                require_log_probs=False,
+                local_search_inference=False if local_search is not None else None,
+            )
+            best_cost = sampler.best_cost
+        best_costs.append(float(best_cost))
         if return_training_metrics and iteration in (0, 4):
-            training_metrics.append(float(sampler.best_cost))
+            training_metrics.append(float(best_cost))
     if return_training_metrics:
         return best_costs, training_metrics
     return best_costs
@@ -86,7 +105,7 @@ def test(
     n_ants,
     n_iterations=10,
     local_search=None,
-    sampling_backend="torch",
+    sampling_backend="numba",
 ):
     """Return mean cumulative best costs across instances, one per ACO round."""
     if not dataset:
@@ -116,7 +135,7 @@ def main(
     n_ants=48,
     n_iterations=10,
     local_search=None,
-    sampling_backend="torch",
+    sampling_backend="numba",
     test_size=None,
 ):
     k_sparse = default_k_sparse(n_node) if k_sparse is None else k_sparse
@@ -135,6 +154,7 @@ def main(
     essential_missing = [
         key for key in incompatible.missing_keys
         if not key.startswith("solution_graph_net.")
+        and not key.startswith("local_edge_gcn.")
     ]
     if essential_missing:
         raise RuntimeError(
@@ -179,12 +199,12 @@ if __name__ == "__main__":
         help="Random seed for reproducible ACO sampling",
     )
     parser.add_argument(
-        "--sampling_backend", choices=("numba", "torch"), default="torch",
-        help="Tour-construction backend",
+        "--sampling_backend", choices=("numba", "torch"), default="numba",
+        help="Tour-construction backend (default: original DeepACO Numba inference)",
     )
     parser.add_argument(
-        "--local_search", choices=("none", "2opt", "nls"), default="none",
-        help="Optional local search; default is pure ACO",
+        "--local_search", choices=("none", "2opt", "nls"), default="nls",
+        help="Local search used after ACO sampling (default: nls)",
     )
     parser.add_argument(
         "--test_size", type=int, default=None,
