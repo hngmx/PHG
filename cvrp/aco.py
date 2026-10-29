@@ -67,6 +67,27 @@ class ACO():
         paths, log_probs = self.gen_path(require_prob=True)
         costs = self.gen_path_costs(paths)
         return costs, log_probs
+
+    def sample_iteration(self, require_prob=True):
+        """One ordinary CVRP ACO iteration, returning the constructed routes.
+
+        The route tensor may contain trailing depot padding for ants that
+        finished before the rest of the population.  The solution archive
+        removes that padding before recording route edges.
+        """
+        if require_prob:
+            paths, log_probs = self.gen_path(require_prob=True)
+        else:
+            paths = self.gen_path(require_prob=False)
+            log_probs = None
+        costs = self.gen_path_costs(paths)
+        with torch.no_grad():
+            best_cost, best_index = costs.min(dim=0)
+            if best_cost < self.lowest_cost:
+                self.lowest_cost = best_cost.item()
+                self.shortest_path = paths[:, best_index].detach().clone()
+            self.update_pheronome(paths, costs)
+        return costs, log_probs, paths
         
 
     @torch.no_grad()

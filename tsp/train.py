@@ -183,6 +183,7 @@ def train(
     quality_mode="relative_diversity",
     quality_temperature=0.1,
     diversity_strength=0.5,
+    graph_layers=2,
 ):
     if steps < 1 or epochs < 1 or n_ants < 1:
         raise ValueError("steps, epochs, and ants must be positive")
@@ -196,7 +197,7 @@ def train(
         raise ValueError("invalid solution graph weighting parameters")
     torch.manual_seed(seed)
     device = torch.device(device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
-    model = GraphNet().to(device)
+    model = GraphNet(graph_layers=graph_layers).to(device)
     if pretrained:
         incompatible = model.load_state_dict(
             torch.load(pretrained, map_location=device), strict=False,
@@ -290,6 +291,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--graph_quality_temperature", type=float, default=0.1)
     parser.add_argument("--graph_diversity_strength", type=float, default=0.5)
+    parser.add_argument("--graph_layers", type=int, default=2)
     options = parser.parse_args()
     default_ants, default_k = original_profile(options.nodes)
     train(
@@ -311,4 +313,5 @@ if __name__ == "__main__":
         quality_mode=options.graph_quality_mode,
         quality_temperature=options.graph_quality_temperature,
         diversity_strength=options.graph_diversity_strength,
+        graph_layers=options.graph_layers,
     )

@@ -55,6 +55,7 @@ if __name__ == "__main__":
     parser.add_argument("--test_size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--graph_layers", type=int, default=2)
     options = parser.parse_args()
     if not options.checkpoints or any(
         checkpoint < 1 for checkpoint in options.checkpoints
@@ -77,7 +78,7 @@ if __name__ == "__main__":
         dataset = dataset[:options.test_size]
     if not dataset:
         parser.error("test dataset cannot be empty")
-    model = GraphNet().to(device)
+    model = GraphNet(graph_layers=options.graph_layers).to(device)
     incompatible = model.load_state_dict(
         torch.load(model_path, map_location=device), strict=False,
     )

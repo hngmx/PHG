@@ -1,75 +1,142 @@
-import time
+"""Evaluate a trained CVRP H0 with ordinary DeepACO ACO search.
+
+The PHG graph and archives are training-only.  Optionally compare a released
+DeepACO checkpoint on the same instances, seeds, ants, and iteration budget.
+"""
+
+import argparse
+import csv
+from pathlib import Path
+
 import torch
-from torch.distributions import Categorical, kl
 
-from net import Net
 from aco import ACO
-from utils import *
+from graph_net import GraphNet
+from net import Net as OriginalNet
+from utils import gen_instance, gen_pyg_data
 
-torch.manual_seed(1234)
 
 EPS = 1e-10
-device = 'cpu'
+ROOT = Path(__file__).resolve().parents[1]
 
-def infer_instance(model, demands, distances, n_ants, t_aco_diff):
-    if model:
-        model.eval()
-        pyg_data = gen_pyg_data(demands, distances, device)
-        heu_vec = model(pyg_data)
-        heu_mat = heu_vec.reshape((n_node+1, n_node+1)) + EPS
-        aco = ACO(
-            distances=distances,
-            demand=demands,
-            n_ants=n_ants,
-            heuristic=heu_mat,
-            device=device
-        )
-    else:
-        aco = ACO(
-            distances=distances,
-            demand=demands,
-            n_ants=n_ants,
-            device=device
-        )
-        
-    results = torch.zeros(size=(len(t_aco_diff),), device=device)
-    for i, t in enumerate(t_aco_diff):
-        best_cost = aco.run(t)
-        results[i] = best_cost
-    return results
-    
+
+def load_instances(n_customers, count, seed, dataset_path=None):
+    source = Path(dataset_path) if dataset_path else (
+        ROOT / "data" / "cvrp" / f"testDataset-{n_customers}.pt"
+    )
+    if source.exists():
+        dataset = torch.load(source, map_location="cpu", weights_only=True)
+        if count > len(dataset):
+            raise ValueError(f"requested {count} instances but {source} has {len(dataset)}")
+        return [(item[0].clone(), item[1:].clone()) for item in dataset[:count]]
+    if dataset_path:
+        raise FileNotFoundError(source)
+    with torch.random.fork_rng(devices=[]):
+        # Keep generated test instances separate from train.py's validation pool.
+        torch.manual_seed(seed + 300000)
+        return [gen_instance(n_customers, "cpu") for _ in range(count)]
+
+
 @torch.no_grad()
-def test(dataset, model, n_ants, t_aco):
-    _t_aco = [0] + t_aco
-    t_aco_diff = [_t_aco[i+1]-_t_aco[i] for i in range(len(_t_aco)-1)]
-    sum_results = torch.zeros(size=(len(t_aco_diff),), device=device)
-    start = time.time()
-    for demands, distances in dataset:
-        results = infer_instance(model, demands, distances, n_ants, t_aco_diff)
-        sum_results += results
-    end = time.time()
-    
-    return sum_results / len(dataset), end-start
+def infer_instance(model, demands, distances, n_ants, iterations, device):
+    model.eval()
+    demands = demands.to(device)
+    distances = distances.to(device)
+    pyg = gen_pyg_data(demands, distances, device)
+    h0 = model(pyg).reshape_as(distances) + EPS
+    aco = ACO(
+        distances=distances, demand=demands, n_ants=n_ants,
+        heuristic=h0, device=str(device),
+    )
+    return [float(aco.run(1)) for _ in range(iterations)]
 
 
+def evaluate(model, instances, n_ants, iterations, device, seed):
+    totals = torch.zeros(iterations, dtype=torch.float64)
+    cuda_devices = [torch.cuda.current_device()] if device.type == "cuda" else []
+    for index, (demands, distances) in enumerate(instances):
+        with torch.random.fork_rng(devices=cuda_devices):
+            torch.manual_seed(seed + index)
+            totals += torch.tensor(
+                infer_instance(model, demands, distances, n_ants, iterations, device),
+                dtype=torch.float64,
+            )
+    return (totals / len(instances)).tolist()
 
-n_ants = 20
-t_aco = [1, 10, 20, 30, 40, 50, 100]
 
-for n_node in [20, 100, 500]:
-    
-    test_list = load_test_dataset(n_node, device)
-    
-    net = Net().to(device)
-    net.load_state_dict(torch.load(f'./pretrained/cvrp/cvrp{n_node}.pt', map_location=device))
-    avg_aco_best, duration = test(test_list, net, n_ants, t_aco)
-    print('total duration: ', duration)
-    for i, t in enumerate(t_aco):
-        print("T={}, average obj. is {}.".format(t, avg_aco_best[i])) 
+def load_model(path, device, graph):
+    model = (GraphNet() if graph else OriginalNet()).to(device)
+    model.load_state_dict(torch.load(path, map_location=device, weights_only=True))
+    return model
 
-    avg_aco_best, duration = test(test_list, None, n_ants, t_aco)
-    print('total duration: ', duration)
-    for i, t in enumerate(t_aco):
-        print("T={}, average obj. is {}.".format(t, avg_aco_best[i]))    
-        
-    print()   
+
+def save_results(path, phg, baseline=None):
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    with (path / "cvrp_iterations.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["iteration", "PHG_H0"] + (["DeepACO"] if baseline else []))
+        for index, cost in enumerate(phg):
+            writer.writerow([index + 1, cost] + ([baseline[index]] if baseline else []))
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+    x = list(range(1, len(phg) + 1))
+    plt.figure(figsize=(7, 4.5))
+    plt.plot(x, phg, marker="o", label="PHG-trained H0")
+    if baseline:
+        plt.plot(x, baseline, marker="s", label="DeepACO")
+    plt.xlabel("ACO iteration")
+    plt.ylabel("Mean best CVRP route length")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(path / "cvrp_iterations.png", dpi=180)
+    plt.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("nodes", type=int, help="number of customers, excluding depot")
+    parser.add_argument("--model", default=None, help="PHG-trained best checkpoint")
+    parser.add_argument("--baseline_model", default=None,
+                        help="optional original DeepACO checkpoint")
+    parser.add_argument("--ants", type=int, default=None)
+    parser.add_argument("--iterations", type=int, default=10)
+    parser.add_argument("--test_size", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--dataset", default=None)
+    parser.add_argument("--output", default=None,
+                        help="optional directory for CSV and PNG trajectory")
+    args = parser.parse_args()
+    if min(args.nodes, args.iterations, args.test_size) < 1:
+        parser.error("nodes, iterations, and test_size must be positive")
+    device = torch.device(args.device)
+    ants = args.ants or (20 if args.nodes == 20 else 50)
+    model_path = args.model or (
+        ROOT / "pretrained" / "cvrp" / "phg_current" / f"cvrp{args.nodes}-best.pt"
+    )
+    instances = load_instances(args.nodes, args.test_size, args.seed, args.dataset)
+    phg = evaluate(
+        load_model(model_path, device, graph=True), instances,
+        ants, args.iterations, device, args.seed,
+    )
+    baseline = None
+    if args.baseline_model:
+        baseline = evaluate(
+            load_model(args.baseline_model, device, graph=False), instances,
+            ants, args.iterations, device, args.seed,
+        )
+    for index, cost in enumerate(phg):
+        line = f"iteration {index + 1}: PHG_H0={cost:.6f}"
+        if baseline is not None:
+            line += f" DeepACO={baseline[index]:.6f}"
+        print(line)
+    if args.output:
+        save_results(args.output, phg, baseline)
+
+
+if __name__ == "__main__":
+    main()
